@@ -172,7 +172,7 @@ umqtt_DecodeLength(uint32_t *pLength, const uint8_t *pEncodedLength)
  * enough to hold the encoded data block.
  */
 static uint32_t
-umqtt_EncodeData(umqtt_Data_t *pDat, uint8_t *pBuf)
+umqtt_EncodeData(const umqtt_Data_t *pDat, uint8_t *pBuf)
 {
     *pBuf++ = pDat->len >> 8;
     *pBuf++ = pDat->len & 0xFF;
