@@ -130,7 +130,7 @@ typedef struct
 } umqtt_Connect_Options_t;
 
 /** Convenience macro to initialize connect options to NULL defaults. */
-#define CONNECT_OPTIONS_INITIALIZER \
+#define CONNECT_OPTIONS_INITIALIZER (umqtt_Connect_Options_t) \
 { false, false, 0, 0, \
   { 0, NULL }, { 0, NULL }, { 0, NULL }, { 0, NULL }, { 0, NULL }}
 
