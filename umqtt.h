@@ -63,8 +63,29 @@ typedef void * umqtt_Handle_t;
 typedef struct
 {
     uint16_t packetId;
-    void (*EventCb)(umqtt_Handle_t, umqtt_Event_t, void *);
+    void (*EventCb)(umqtt_Handle_t, umqtt_Event_t, void *, void *);
+    void *pUser;
 } umqtt_Instance_t;
+
+/**
+ * Defines the size of memory required for umqtt instance.  This can be
+ * used to allocate memory required to initialize a umqtt instance.
+ *
+ * __Example__
+ * ~~~~~~~~.c
+ * uint8_t umqttInstanceMem[UMQTT_INSTANCE_SIZE];
+ *
+ * umqtt_Handle_t h;
+ * void myEventCallback(umqtt_Handle_t h, umqtt_Event_t event);
+ *
+ * h = umqtt_InitInstance(umqttInstanceMem, myEventCallback);
+ * if (h == NULL)
+ * {
+ *     // handle error
+ * }
+ * ~~~~~~~~
+ */
+#define UMQTT_INSTANCE_SIZE sizeof(umqtt_Instance_t)
 
 /**
  * Structure to hold a block of data.
@@ -367,6 +388,7 @@ static inline umqtt_Error_t umqtt_BuildDisconnect(umqtt_Handle_t h, umqtt_Data_t
  * @param h umatt instance handle associated with the event
  * @param event notification event
  * @param pArg data associated with the event (see table below)
+ * @param pUser client supplied argument (from umqtt_InitInstance())
  *
  * The client must implement a callback function to receive notifications.
  * The callback function can be any name (the name here is just an example
@@ -394,7 +416,7 @@ static inline umqtt_Error_t umqtt_BuildDisconnect(umqtt_Handle_t h, umqtt_Data_t
  * callback function, it must make copies of the data.  Once the callback
  * function returns, the data that was passed by _pArg_ does not persist.
  */
-void umqtt_EventCallback(umqtt_Handle_t h, umqtt_Event_t event, void *pArg);
+void umqtt_EventCallback(umqtt_Handle_t h, umqtt_Event_t event, void *pArg, void *pUser);
 
 /**
  * @}
@@ -405,8 +427,9 @@ extern "C" {
 #endif
 
 extern umqtt_Handle_t
-umqtt_InitInstance(umqtt_Instance_t *pInst,
-                  void (*pfnEvent)(umqtt_Handle_t, umqtt_Event_t, void *));
+umqtt_InitInstance(void *pInst,
+                  void (*pfnEvent)(umqtt_Handle_t, umqtt_Event_t, void *, void *),
+                  void *pUser);
 extern umqtt_Error_t umqtt_BuildConnect(umqtt_Handle_t h, umqtt_Data_t *pOutBuf,
                                         const umqtt_Connect_Options_t *pOptions);
 extern umqtt_Error_t umqtt_BuildPublish(umqtt_Handle_t h, umqtt_Data_t *pOutBuf,
@@ -417,6 +440,7 @@ extern umqtt_Error_t
 umqtt_BuildUnsubscribe(umqtt_Handle_t h, umqtt_Data_t *pOutBuf, umqtt_Unsubscribe_Options_t *pOptions);
 
 extern umqtt_Error_t umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming);
+extern char * umqtt_GetErrorString(umqtt_Error_t err);
 
 #ifdef __cplusplus
 extern }

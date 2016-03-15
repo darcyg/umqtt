@@ -94,6 +94,31 @@
 // error handling convenience
 #define RETURN_IF_ERR(c,e) do{if(c){return (e);}}while(0)
 
+static char *errCodeStrings[] =
+{
+    "UMQTT_ERR_OK",
+    "UMQTT_ERR_RET_LEN",
+    "UMQTT_ERR_PACKET_ERROR",
+    "UMQTT_ERR_BUFSIZE",
+    "UMQTT_ERR_PARM",
+};
+
+/**
+ * Get string representing an error code.
+ *
+ * @param err is the error code to decode
+ *
+ * @return a human readable string representation of the error code
+ *
+ * This function is useful for debugging.  It can be used to print
+ * a meaningful string for an error code.
+ */
+char *
+umqtt_GetErrorString(umqtt_Error_t err)
+{
+    return errCodeStrings[err];
+}
+
 /** @internal
  *
  * Encode length into MQTT remaining length format
@@ -877,7 +902,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                     umqtt_Connect_Result_t result;
                     result.sessionPresent = pData[2] & 1 ? true : false;
                     result.returnCode = pData[3];
-                    pInst->EventCb(h, UMQTT_EVENT_CONNECTED, &result);
+                    pInst->EventCb(h, UMQTT_EVENT_CONNECTED, &result, pInst->pUser);
                 }
                 break;
             }
@@ -886,7 +911,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             case UMQTT_TYPE_PUBLISH:
             {
                 umqtt_Publish_Options_t pubdata;
-                uint8_t pktId[2];
+                uint8_t pktId[2] = {0, 0};
 
                 // make sure there is a callback function
                 if (pInst->EventCb)
@@ -941,7 +966,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                     RETURN_IF_ERR(remainingLen != 0, UMQTT_ERR_PACKET_ERROR);
 
                     // callback to provide the publish info to the app
-                    pInst->EventCb(h, UMQTT_EVENT_PUBLISH, &pubdata);
+                    pInst->EventCb(h, UMQTT_EVENT_PUBLISH, &pubdata, pInst->pUser);
 
                     // if QoS is non-0, prepare a reply packet and
                     // notify through the callback
@@ -956,7 +981,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                         pubackdat[3] = pktId[1];
                         puback.len = 4;
                         puback.data = pubackdat;
-                        pInst->EventCb(h, UMQTT_EVENT_REPLY, &puback);
+                        pInst->EventCb(h, UMQTT_EVENT_REPLY, &puback, pInst->pUser);
                     }
                 }
 
@@ -969,7 +994,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                 if (pInst->EventCb)
                 {
                     // TODO: something to verify packet id
-                    pInst->EventCb(h, UMQTT_EVENT_PUBACK, NULL);
+                    pInst->EventCb(h, UMQTT_EVENT_PUBACK, NULL, pInst->pUser);
                 }
                 break;
             }
@@ -987,7 +1012,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                     // pass suback payload back to client
                     subackData.len = remainingLen - 2;
                     subackData.data = &pData[4];
-                    pInst->EventCb(h, UMQTT_EVENT_SUBACK, &subackData);
+                    pInst->EventCb(h, UMQTT_EVENT_SUBACK, &subackData, pInst->pUser);
                 }
                 break;
             }
@@ -998,7 +1023,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                 if (pInst->EventCb)
                 {
                     // TODO: something to verify packet id
-                    pInst->EventCb(h, UMQTT_EVENT_UNSUBACK, NULL);
+                    pInst->EventCb(h, UMQTT_EVENT_UNSUBACK, NULL, pInst->pUser);
                 }
                 break;
             }
@@ -1008,7 +1033,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             {
                 if (pInst->EventCb)
                 {
-                    pInst->EventCb(h, UMQTT_EVENT_PINGRESP, NULL);
+                    pInst->EventCb(h, UMQTT_EVENT_PINGRESP, NULL, pInst->pUser);
                 }
                 break;
             }
@@ -1058,14 +1083,18 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
  * ~~~~~~~~
  */
 umqtt_Handle_t
-umqtt_InitInstance(umqtt_Instance_t *pInst, void (*pfnEvent)(umqtt_Handle_t, umqtt_Event_t, void *))
+umqtt_InitInstance(void *pInst,
+                   void (*pfnEvent)(umqtt_Handle_t, umqtt_Event_t, void *, void *),
+                   void *pUser)
 {
     if (pInst == NULL)
     {
         return NULL;
     }
-    pInst->EventCb = pfnEvent;
-    pInst->packetId = 0;
+    umqtt_Instance_t *this = pInst;
+    this->EventCb = pfnEvent;
+    this->pUser = pUser;
+    this->packetId = 0;
     return pInst;
 }
 
