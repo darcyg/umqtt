@@ -15,7 +15,7 @@
 #define __UMQTT_H__
 
 /**
- * @addtogroup umqtt_client
+ * @addtogroup umqtt_api
  * @{
  */
 
@@ -25,398 +25,237 @@
 typedef enum
 {
     UMQTT_ERR_OK,           ///< normal return code, no errors
-    /// calculated length is returned, this is not an error
-    UMQTT_ERR_RET_LEN,
     UMQTT_ERR_PACKET_ERROR, ///< detected error in packet during decoding
-    UMQTT_ERR_BUFSIZE,      ///< buffer not big enough to hold packet
+    UMQTT_ERR_BUFSIZE,      ///< unable to allocate memory for a packet
     UMQTT_ERR_PARM,         ///< problem with function input parameter
+    UMQTT_ERR_NETWORK,      ///< error writing or reading network
+    UMQTT_ERR_CONNECT_PENDING, ///< connect is in progress
+    UMQTT_ERR_CONNECTED,    ///< umqtt client is connected to MQTT broker
+    UMQTT_ERR_DISCONNECTED, ///< umqtt client is not connected to MQTT broker
+    UMQTT_ERR_TIMEOUT,      ///< a timeout occurred waiting on some reply
 } umqtt_Error_t;
 
 /**
- * Event codes that are passed to the callback function.  See the
- * documentation for umqtt_EventCallback() for more details.
- */
-typedef enum
-{
-    UMQTT_EVENT_NONE,       ///< no event
-    UMQTT_EVENT_CONNECTED,  ///< server acknowledged connection
-    UMQTT_EVENT_PUBLISH,    ///< a subscribed topic was published to the client
-    UMQTT_EVENT_PUBACK,     ///< a published topic was acknowledged by the server
-    UMQTT_EVENT_SUBACK,     ///< a subscribe was acknowledged by the server
-    UMQTT_EVENT_UNSUBACK,   ///< an unsubscribe was acknowledged by the server
-    UMQTT_EVENT_PINGRESP,   ///< a ping was acknowledged by the server
-    UMQTT_EVENT_REPLY,      ///< a reply packet is available to send to the server
-} umqtt_Event_t;
-
-/**
  * umqtt instance handle, to be passed to all functions.  Obtained
- * from umqtt_InitInstance().
+ * from umqtt_New().
  */
 typedef void * umqtt_Handle_t;
 
 /**
- * umqtt instance data structure.  The client should allocate one of
- * these for each MQTT connection (normally only one).  Even though the
- * fields are exposed here, the client should treat this as an opaque
- * type and not directly access any of the fields.
+ * Callback function for CONNACK connection acknowledgment.
+ *
+ * @param h umqtt instance handle
+ * @param pUser client's optional user data pointer
+ * @param sessionPresent MQTT session present flag
+ * @param retCode return code for the MQTT connection attempt
+ *
+ * This function is called when a CONNACK is received in response to
+ * umqtt_Connect().  The application can use this callback to know when
+ * a connection is complete and ready to be used.
+ */
+typedef void (*ConnackCb_t)(umqtt_Handle_t h, void *pUser,
+                            bool sessionPresent, uint8_t retCode);
+
+/**
+ * Callback function for Publish packets.
+ *
+ * @param h umqtt instance handle
+ * @param pUser client's optional user data pointer
+ * @param dup MQTT dup header flag was set in the packet
+ * @param retain MQTT retain flag was set in the packet
+ * @param qos QoS level for the packet
+ * @param pTopic pointer to topic string
+ * @param topicLen number of bytes in the topic string
+ * @param pMsg pointer to topic message
+ * @param msgLen number of bytes in the topic message
+ *
+ * This function is called when the umqtt client receives a publish
+ * packet from the MQTT broker.  While this callback function is optional,
+ * it is the only way for the umqtt client application to be notified of
+ * publish messages.  If any of the packet contents such as the topic or
+ * message needs to be retained, then this function must make a copy.
+ * Once this function returns the pointers will be no longer valid.
+ */
+typedef void (*PublishCb_t)(umqtt_Handle_t h, void *pUser, bool dup, bool retain,
+                            uint8_t qos, const char *pTopic, uint16_t topicLen,
+                            const uint8_t *pMsg, uint16_t msgLen);
+
+/**
+ * Callback function for Puback packets.
+ *
+ * @param h umqtt instance handle
+ * @param pUser client's optional user data pointer
+ * @param pktId packet ID of the received packet
+ *
+ * This function is called when the umqtt client receives a Puback
+ * packet in response to umqtt_Publish().  It is not necessary for the
+ * application to use this callback unless it needs to track completion
+ * of publish messages.  The _pktId_ parameter should match the message ID
+ * that was returned when using umqtt_Publish().  This method could be used
+ * to throttle publish actions (ensure that only one publish is sent at
+ * a time).  The umqtt_Run() function takes care of tracking acknowledgments
+ * and handling retries, so this function is just informative.
+ */
+typedef void (*PubackCb_t)(umqtt_Handle_t h, void *pUser, uint16_t pktId);
+
+/**
+ * Callback function for Suback packets.
+ *
+ * @param h umqtt instance handle
+ * @param pUser client's optional user data pointer
+ * @param retCodes array of return codes, one for each subscribe topic
+ * @param retCount number of return codes in the retCodes array
+ * @param pktId packet ID of the received packet
+ *
+ * This function is called when the umqtt client receives a Suback
+ * packet in response to umqtt_Subscribe().  It is not necessary for the
+ * application to use this callback unless it needs to track completion
+ * of subscribe messages or needs confirmation of subscribe topic return
+ * codes.  The _pktId_ parameter should match the message ID that was
+ * returned when using umqtt_Subscribe().  The umqtt_Run() function takes
+ * care of tracking acknowledgments and handling retries.
+ */
+typedef void (*SubackCb_t)(umqtt_Handle_t h, void *pUser, const uint8_t *retCodes,
+                           uint16_t retCount, uint16_t pktId);
+
+/**
+ * Callback function for Unsuback packets.
+ *
+ * @param h umqtt instance handle
+ * @param pUser client's optional user data pointer
+ * @param pktId packet ID of the received packet
+ *
+ * This function is called when the umqtt client receives a Unsuback
+ * packet in response to umqtt_Unsubscribe().  It is not necessary for the
+ * application to use this callback unless it needs to track completion
+ * of unsubscribe messages.  The _pktId_ parameter should match the message
+ * ID that was returned when using umqtt_Unsubscribe().  The umqtt_Run()
+ * function takes care of tracking acknowledgments and handling retries.
+ */
+typedef void (*UnsubackCb_t)(umqtt_Handle_t h, void *pUser, uint16_t pktId);
+
+/**
+ * Callback function for PINGRESP packets.
+ *
+ * @param h umqtt instance handle
+ * @param pUser client's optional user data pointer
+ *
+ * This function is called when the umqtt client receives a PINGRESP
+ * in response to umqtt_Pingreq().  There is no reason for the application
+ * to use this callback but it is here for completeness.  It could be used
+ * as a kind of heartbeat although the interval will not be reliable.
+ * The umqtt_Run() function takes care of sending and receiving ping
+ * messages at the appropriate time.
+ */
+typedef void (*PingrespCb_t)(umqtt_Handle_t h, void *pUser);;
+
+/**
+ * Structure to hold callback functions.
  */
 typedef struct
 {
-    uint16_t packetId;
-    void (*EventCb)(umqtt_Handle_t, umqtt_Event_t, void *, void *);
-    void *pUser;
-} umqtt_Instance_t;
+    /// Called when a CONNACK is received.
+    ConnackCb_t connackCb;
+    /// Called when PUBLISH packet is received.
+    PublishCb_t publishCb;
+    /// Called when PUBACK is received.
+    PubackCb_t pubackCb;
+    /// Called when SUBACK is received.
+    SubackCb_t subackCb;
+    /// Called when UNSUBACK is received.
+    UnsubackCb_t unsubackCb;
+    /// Called when PINGRESP is received.
+    PingrespCb_t pingrespCb;
+} umqtt_Callbacks_t;
 
 /**
- * Defines the size of memory required for umqtt instance.  This can be
- * used to allocate memory required to initialize a umqtt instance.
+ * Memory allocation function provided by application.
  *
- * __Example__
- * ~~~~~~~~.c
- * uint8_t umqttInstanceMem[UMQTT_INSTANCE_SIZE];
+ * @param size the number of bytes to be allocated
  *
- * umqtt_Handle_t h;
- * void myEventCallback(umqtt_Handle_t h, umqtt_Event_t event);
+ * @return pointer to the allocated memory or NULL
  *
- * h = umqtt_InitInstance(umqttInstanceMem, myEventCallback);
- * if (h == NULL)
- * {
- *     // handle error
- * }
- * ~~~~~~~~
+ * This function must be implemented by the application.  The umqtt library
+ * uses this when it needs to request memory for building MQTT packets.
+ * The application is free to implement this in any way.  It can just pass
+ * through the system malloc, or it could use other memory allocator methods
+ * (such as bget).  Or it can implement a simple list of fixed buffers and
+ * just allocate one of those each time this function is called.
  */
-#define UMQTT_INSTANCE_SIZE sizeof(umqtt_Instance_t)
+typedef void *(*malloc_t)(size_t size);
 
 /**
- * Structure to hold a block of data.
+ * Memory free function provided by application.
  *
- * MQTT defines most blocks of data as a length field followed by the
- * data payload.  This applies to topic strings, topic payloads, and
- * other packet data that is of variable length.  This structure is used
- * to represent that kind of data as well as the overall MQTT packets
- * that are passed to and from the client.
+ * @param ptr pointer to the previously allocated memory buffer
+ *
+ * This function must be implemented by the application.  The umqtt library
+ * uses this when it needs to free memory that was earlier allocated for
+ * packet memory.
  */
-typedef struct
-{
-    uint16_t len;   ///< length of the data block
-    uint8_t *data;  ///< pointer to the start of the data block
-} umqtt_Data_t;
+typedef void (*free_t)(void *ptr);
 
 /**
- * A convenience macro for populating an MQTT data block with a string.
+ * Read a packet from the network
  *
- * @param var the umqtt_Data_t variable to initialize
- * @param str the string to load into the variable
+ * @param hNet is the network instance handle (not umqtt instance handle)
+ * @param ppBuf pointer to a pointer to the received packet data
  *
- * __Example__
- * ~~~~~~~~.c
- * umqtt_Data_t myTopic;
- * UMQTT_INIT_DATA_STR(myTopic, "myTopicName");
- * ~~~~~~~~
+ * @return number of bytes that were read from the network.  This will be
+ * 0 if no data was read, or negative if there is an error.
+ *
+ * This function must be implemented by the application.  It is used by the
+ * umqtt library when it needs to read a new packet from the network.
+ * A double pointer is used (__ppBuf__) so that the umqtt library does not
+ * need to make any additional copy of the data.  This function must allocate
+ * the memory used to hold the packet in a method compatible with the
+ * malloc_t() / free_t() functions.  The umqtt_Run() function will use the
+ * free_t() function to free this packet after it has been decoded.
+ *
+ * The incoming packet must be a complete packet.  The `umqtt` library does
+ * not handle partial packets or misaligned packets.
  */
-#define UMQTT_INIT_DATA_STR(var, str) do{(var).data=(uint8_t*)(str);(var).len=strlen(str);}while(0)
+typedef int (*netReadPacket_t)(void *hNet, uint8_t **ppBuf);
 
 /**
- * A convenience macro for populating an MQTT data block with a static buffer.
+ * Write a packet to the network
  *
- * @param v the umqtt_Data_t variable to initialize
- * @param b the buffer to load into the variable
+ * @param hNet is the network instance handle (not umqtt instance handle)
+ * @param pBuf pointer to the buffer holding the packet data
+ * @param len count of byte in the buffer
+ * @param isMore flag to indicate that there is additional data to send
  *
- * __Example__
- * ~~~~~~~~.c
- * // buffer for holding encoded packets
- * umqtt_Data_t packetData;
- * uint8_t storageBuf[128];
- * UMQTT_INIT_DATA_STATIC_BUF(packetData, storageBuf);
- * ~~~~~~~~
+ * @return number of bytes that were written to the network.  This will be
+ * 0 if no data was written or negative if there was an error.
+ *
+ * This function must be implemented by the application.  It is called by the
+ * umqtt library when it needs to send a packet to the network.  The packet
+ * must be all sent or none.  The umqtt library cannot handle a partial
+ * transmit.  If anything less than the complete number of bytes are sent
+ * it will be considered a network error.  The network write function can
+ * optionally use the _isMore_ parameter to aggregate packet data before
+ * sending it over the network link.  Usually _isMore_ is false.
  */
-#define UMQTT_INIT_DATA_STATIC_BUF(v,b) do{(v).data=(b);(v).len=sizeof(b);}while(0)
+typedef int (*netWritePacket_t)(void *hNet, const uint8_t *pBuf, uint32_t len, bool isMore);
 
 /**
- * Options structure for CONNECT packet.  The client populates this
- * and passes to umqtt_BuildConnect().  See MQTT specification for a
- * complete explanation of the meaning of the fields.
- */
-typedef struct
-{
-    bool cleanSession;      ///< server should start with clean session
-    bool willRetain;        ///< server should retain the will topic, if used
-    uint8_t qos;            ///< QoS to be used for the will topic
-    uint16_t keepAlive;     ///< time interval for keepalive (ping) packets
-    umqtt_Data_t clientId;  ///< data block holding the client identifier string
-    umqtt_Data_t willTopic; ///< data block holding the will topic, if used (can be NULL)
-    umqtt_Data_t willMessage;///< data block holding the will message (if used)
-    umqtt_Data_t username;  ///< data block holding the optional user name
-    umqtt_Data_t password;  ///< data block holding the optional password
-} umqtt_Connect_Options_t;
-
-/** Convenience macro to initialize connect options to NULL defaults. */
-#define CONNECT_OPTIONS_INITIALIZER (umqtt_Connect_Options_t) \
-{ false, false, 0, 0, \
-  { 0, NULL }, { 0, NULL }, { 0, NULL }, { 0, NULL }, { 0, NULL }}
-
-/**
- * Structure to hold results of a connection acknowledgment (CONNACK).
- *
- * When umqtt decodes a CONNACK packet from the server, it will notify
- * the client by passing this structure to the callback function.  The client
- * can obtain the results of the connection.
+ * Structure to define the network interface.
  */
 typedef struct
 {
-    bool sessionPresent;    ///< server already has session state for the client
-    uint8_t returnCode;     ///< connect return code, normally 0
-} umqtt_Connect_Result_t;
-
-/**
- * Options for a PUBLISH packet.  The client populates this structure
- * and passes it to umqtt_BuildPublish() to create a PUBLISH packet.  See
- * the MQTT specification for a complete explanation of the fields.
- */
-typedef struct
-{
-    bool dup;       ///< DUP flag, true if this is a duplicate PUBLISH
-    bool retain;    ///< server should retain the published topic
-    uint8_t qos;    ///< QoS for this publish topic (0-2)
-    umqtt_Data_t topic;     ///< data block holding the topic to publish
-    umqtt_Data_t message;   ///< data block holding the optional topic payload
-} umqtt_Publish_Options_t;
-
-/** Convenience macro to initialize publish options to NULL defaults. */
-#define PUBLISH_OPTIONS_INITIALIZER {false, false, 0, {0, NULL}, {0, NULL}}
-
-/**
- * Options for a SUBSCRIBE packet.  The client populates this structure
- * and passes it to umqtt_BuildSubscribe() to create a SUBSCRIBE packet.  See
- * the MQTT specification for a complete explanation of the fields.
- */
-typedef struct
-{
-    uint32_t count;         ///< count of the number of topics/QoS in the topic array
-    umqtt_Data_t *pTopics;  ///< array of data blocks holding the topics to subscribe
-    uint8_t *pQos;          ///< array of QoS value (one for each topic)
-} umqtt_Subscribe_Options_t;
-
-/** Convenience macro to initialize subscribe options to NULL defaults. */
-#define SUBSCRIBE_OPTIONS_INITIALIZER {0, NULL, NULL}
-
-/**
- * Convenience macro to initialize umqtt_Subscribe_Options_t structure.
- *
- * @param opt subscribe options data structure
- * @param cnt count of topics/QoS in the subscribe
- * @param t array of topic data blocks (at least 1)
- * @param q array of QoS value (must match topics)
- */
-#define UMQTT_INIT_SUBSCRIBE(opt, cnt, t, q) do{(opt).count=cnt;(opt).pTopics=t;(opt).pQos=q;}while(0)
-
-/**
- * Options for an UNSUBSCRIBE packet.  The client populates this structure
- * and passes it to umqtt_BuildUnsubscribe() to create an UNSUBSCRIBE packet.
- * See the MQTT specification for a complete explanation of the fields.
- */
-typedef struct
-{
-    uint32_t count;         ///< count of topics in the topic array
-    umqtt_Data_t *pTopics;  ///< array of topic data blocks, list to unsubscribe
-} umqtt_Unsubscribe_Options_t;
-
-/** Convenience macro to initialize subscribe options to NULL defaults. */
-#define UNSUBSCRIBE_OPTIONS_INITIALIZER {0, NULL}
-
-/**
- * Convenience macro to initialize umqtt_Unsubscribe_Options_t structure.
- *
- * @param opt unsubscribe options data structure
- * @param cnt count of topics in the unsubscribe
- * @param t array of topic data blocks (at least 1)
- */
-#define UMQTT_INIT_UNSUBSCRIBE(opt, cnt, t) do{(opt).count=cnt;(opt).pTopics=t;}while(0)
-
-/**
- * Build an MQTT PINGREQ packet.
- *
- * @param h the umqtt instance handle
- * @param pOutBuf points at the data buffer to hold the encoded PINGREQ packet
- *
- * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
- *
- * This function is used to create a PINGREQ packet.  The client must send
- * a PINGREQ to the server at an interval no longer than the keep-alive
- * time that was specified in the connect options.  The caller must allocate
- * the buffer space needed to hold the packet, which is always 2 bytes for
- * this type of packet.
- *
- * The encoded packet is returned to the caller through the output buffer
- * _pOutBuf_.  The data will be written to ->data and the length will be
- * written to the ->len field of the caller-supplied _pOutBuf_ output buffer
- * structure.
- *
- * @note This function is simple and marked as inline to reduce the
- * overhead of a function call for such a simple operation.
- *
- * __Example__
- *
- * ~~~~~~~~.c
- * umqtt_Handle_t h; // previously acquired instance handle
- *
- * // buffer to store output packet
- * static uint8_t pktbuf[2];
- * umqtt_Data_t outbuf;
- * UMATT_INIT_DATA_STATIC_BUF(outbuf, pktbuf);
- *
- * // build the PINGREQ packet
- * umqtt_Error_t err;
- * err = umqtt_BuildPingreq(h, &outbuf);
- * if (err == UMQTT_ERR_OK)
- * {
- *     // send packet using your network method
- *     // packet data is in outbuf.data, length is in outbuf.len
- *     mynet_send_function(outbuf.data, outbuf.len);
- * }
- * else
- * {
- *     // handle build error
- * }
- * ~~~~~~~~
- */
-static inline umqtt_Error_t umqtt_BuildPingreq(umqtt_Handle_t h, umqtt_Data_t *pOutbuf)
-{
-    pOutbuf->data[0] = 0xC0;
-    pOutbuf->data[1] = 0;
-    pOutbuf->len = 2;
-    return UMQTT_ERR_OK;
-}
-
-/**
- * Initializer for PINGREQ packet
- *
- * This is a convenience macro that can be (optionally) used to create
- * a PINGREQ packet.  Since the PINGREQ is always the same and is used
- * periodically, it makes sense to create a const array to hold it.  This
- * can be used instead of umqtt_BuildPingreq().
- *
- * __Example__
- * ~~~~~~~~.c
- * // Create a PINGREQ packet in const memory (flash)
- * const uint8_t pingreqPacket[2] = PINGREQ_PACKET_INITIALIZER;
- *
- * ...
- *
- * // send PINGREQ packet using network method
- * mynet_send_function(pingreqPacket, sizeof(pingreqPacket));
- * ~~~~~~~~
- */
-#define PINGREQ_PACKET_INITIALIZER { 0xC0, 0 }
-
-/**
- * Build an MQTT DISCONNECT packet.
- *
- * @param h the umqtt instance handle
- * @param pOutBuf points at the data buffer to hold the encoded DISCONNECT packet
- *
- * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
- *
- * This function is used to create a DISCONNECT packet.  The client must send
- * a DISCONNECT to the server in order to cleanly terminate the MQTT
- * connection.  The caller must allocate the buffer space needed to hold
- * the packet, which is always 2 bytes for this type of packet.
- *
- * The encoded packet is returned to the caller through the output buffer
- * _pOutBuf_.  The data will be written to ->data and the length will be
- * written to the ->len field of the caller-supplied _pOutBuf_ output buffer
- * structure.
- *
- * @note This function is simple and marked as inline to reduce the
- * overhead of a function call for such a simple operation.
- *
- * __Example__
- *
- * ~~~~~~~~.c
- * umqtt_Handle_t h; // previously acquired instance handle
- *
- * // buffer to store output packet
- * static uint8_t pktbuf[2];
- * umqtt_Data_t outbuf;
- * UMATT_INIT_DATA_STATIC_BUF(outbuf, pktbuf);
- *
- * // build the DISCONNECT packet
- * umqtt_Error_t err;
- * err = umqtt_BuildDisconnect(h, &outbuf);
- * if (err == UMQTT_ERR_OK)
- * {
- *     // send packet using your network method
- *     // packet data is in outbuf.data, length is in outbuf.len
- *     mynet_send_function(outbuf.data, outbuf.len);
- * }
- * else
- * {
- *     // handle build error
- * }
- * ~~~~~~~~
- */
-static inline umqtt_Error_t umqtt_BuildDisconnect(umqtt_Handle_t h, umqtt_Data_t *pOutbuf)
-{
-    pOutbuf->data[0] = 0xE0;
-    pOutbuf->data[1] = 0;
-    pOutbuf->len = 2;
-    return UMQTT_ERR_OK;
-}
-
-/**
- * Initializer for DISCONNECT packet
- *
- * This is a convenience macro that can be (optionally) used to create
- * a DISCONNECT packet.  This can be used instead of umqtt_BuildDisconnect().
- *
- * __Example__
- * ~~~~~~~~.c
- * // Create a DISCONNECT packet in const memory (flash)
- * const uint8_t disconnectPacket[2] = DISCONNECT_PACKET_INITIALIZER;
- *
- * ...
- *
- * // send DISCONNECT packet using network method
- * mynet_send_function(disconnectPacket, sizeof(disconnectPacket));
- * ~~~~~~~~
- */
-#define DISCONNECT_PACKET_INITIALIZER { 0xE0, 0 }
-
-/**
- * Client callback for event notifications.
- *
- * @param h umatt instance handle associated with the event
- * @param event notification event
- * @param pArg data associated with the event (see table below)
- * @param pUser client supplied argument (from umqtt_InitInstance())
- *
- * The client must implement a callback function to receive notifications.
- * The callback function can be any name (the name here is just an example
- * for purposes of documentation) and is passed to umqtt using the
- * umqtt_InitInstance() function.
- *
- * The notification callback function is always called from the
- * umqtt_DecodePacket() function.
- *
- * Some event have associated data and others do not.  The following table
- * shows the data associated with each type of event.  See also
- * umqtt_Event_t for a description of each event type.
- *
- * Event                 | Data (pArg)
- * ----------------------|------------
- * UMQTT_EVENT_CONNECTED | umqtt_Connect_Result_t (session present flag, connect return code
- * UMQTT_EVENT_PUBLISH   | umqtt_Publish_Options_t (publish flags, QoS, topic and payload
- * UMQTT_EVENT_PUBACK    | NULL
- * UMQTT_EVENT_SUBACK    | umqtt_Data_t (suback payload as uint8_t array)
- * UMQTT_EVENT_UNSUBACK  | NULL
- * UMQTT_EVENT_PINGRESP  | NULL
- * UMQTT_EVENT_REPLY     | umqtt_Data_t containing MQTT reply packet (see notes)
- *
- * If the client needs to retain the callback data beyond the scope of the
- * callback function, it must make copies of the data.  Once the callback
- * function returns, the data that was passed by _pArg_ does not persist.
- */
-void umqtt_EventCallback(umqtt_Handle_t h, umqtt_Event_t event, void *pArg, void *pUser);
+    /// Network instance handle.  The meaning of this is application defined.
+    /// It can be a data structure that holds network sockets or something
+    /// similar.
+    void *hNet;
+    /// Application supplied function to allocate memory.
+    malloc_t pfnmalloc;
+    /// Application supplied function to free memory.
+    free_t pfnfree;
+    /// Application supplied function to read from the network.
+    netReadPacket_t pfnNetReadPacket;
+    /// Application supplied function to write to the network.
+    netWritePacket_t pfnNetWritePacket;
+} umqtt_TransportConfig_t;
 
 /**
  * @}
@@ -426,21 +265,28 @@ void umqtt_EventCallback(umqtt_Handle_t h, umqtt_Event_t event, void *pArg, void
 extern "C" {
 #endif
 
-extern umqtt_Handle_t
-umqtt_InitInstance(void *pInst,
-                  void (*pfnEvent)(umqtt_Handle_t, umqtt_Event_t, void *, void *),
-                  void *pUser);
-extern umqtt_Error_t umqtt_BuildConnect(umqtt_Handle_t h, umqtt_Data_t *pOutBuf,
-                                        const umqtt_Connect_Options_t *pOptions);
-extern umqtt_Error_t umqtt_BuildPublish(umqtt_Handle_t h, umqtt_Data_t *pOutBuf,
-                                        const umqtt_Publish_Options_t *pOptions);
-extern umqtt_Error_t
-umqtt_BuildSubscribe(umqtt_Handle_t h, umqtt_Data_t *pOutBuf, umqtt_Subscribe_Options_t *pOptions);
-extern umqtt_Error_t
-umqtt_BuildUnsubscribe(umqtt_Handle_t h, umqtt_Data_t *pOutBuf, umqtt_Unsubscribe_Options_t *pOptions);
-
-extern umqtt_Error_t umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming);
-extern char * umqtt_GetErrorString(umqtt_Error_t err);
+extern umqtt_Error_t umqtt_Connect(umqtt_Handle_t h, bool cleanSession,
+    bool willRetain, uint8_t willQos, uint16_t keepAlive, const char *clientId,
+    const char *willTopic, const uint8_t *willPayload, uint32_t willPayloadLen,
+    const char *username, const char *password);
+extern umqtt_Error_t umqtt_Publish(umqtt_Handle_t h, const char *topic,
+                                   const uint8_t *payload, uint32_t payloadLen,
+                                   uint32_t qos, bool shouldRetain,
+                                   uint16_t *pId);
+extern umqtt_Error_t umqtt_Subscribe(umqtt_Handle_t h, uint32_t count,
+                                     const char *topics[], uint8_t qoss[],
+                                     uint16_t *pId);
+extern umqtt_Error_t umqtt_Unsubscribe(umqtt_Handle_t h, uint32_t count,
+                                       const char *topics[], uint16_t *pId);
+extern umqtt_Error_t umqtt_DecodePacket(umqtt_Handle_t h,
+                                        const uint8_t *pIncoming, uint32_t incomingLen);
+extern umqtt_Error_t umqtt_GetConnectedStatus(umqtt_Handle_t h);
+extern umqtt_Error_t umqtt_Disconnect(umqtt_Handle_t h);
+extern umqtt_Error_t umqtt_PingReq(umqtt_Handle_t h);
+extern umqtt_Error_t umqtt_Run(umqtt_Handle_t h, uint32_t msTicks);
+extern umqtt_Handle_t umqtt_New(umqtt_TransportConfig_t *pTransport,
+                                         umqtt_Callbacks_t *pCallbacks, void *pUser);
+extern void umqtt_Delete(umqtt_Handle_t h);
 
 #ifdef __cplusplus
 extern }

@@ -19,43 +19,76 @@
 #include "umqtt.h"
 
 /**
- * @addtogroup umqtt_client MQTT client packet processing for microcontrollers
  *
- * This library provides a set of function for processing MQTT client
- * packets.  It is intended primarily for use with microcontrollers.
- *
- * The design goals:
- * - written to be portable, not targeting any specific platform
- * - completely isolate the packet processing from packet transmission
- *   and reception
- * - not dependent on any particular RTOS, does not require RTOS but could
- *   be used with on
- * - not tied to any particular networking hardware or stack
- * - have well documented, consistent and understandable API
- *
- * The library uses instance handles so the same code can be used for
- * multiple client connections to one or more MQTT servers.
- *
- * __Sending__
- *
- * - Populate options structure as needed, depending on type of packet
- *   (CONNECT, SUBSCRIBE, etc)
- * - Initialize a data block, allocating buffer space as needed (can be
- *   static or dynamic).  The data block will hold the outgoing packet.
- * - Call packet-building function
- * - Check return error code
- * - Pass returned data block (buffer and length) to your network transmission
- *   function.
- *
- * ~~~~~~~~.c
- * // simple example to subscribe to a single topic with QoS 0
- *
- * ~~~~~~~~
- *
+ * @addtogroup umqtt_api uMQTT API
  * @{
+ *
+ * Functions you call to operate MQTT client
+ * -----------------------------------------
+ *
+ * Function Name              | Description
+ * ---------------------------|------------
+ * umqtt_New()                | Create and initialize umqtt instance
+ * umqtt_Delete()             | de-initialize umqtt instace (frees resources)
+ * umqtt_Run()                | main run loop
+ * umqtt_Connect()            | establish protocol connection to MQTT broker
+ * umqtt_Disconnect()         | protocol disconnect from MQTT broker
+ * umqtt_Publish()            | publish a topic
+ * umqtt_Subscribe()          | subscribe to topic(s)
+ * umqtt_Unsubscribe()        | unsubscribe from topic(s)
+ * umqtt_GetErrorString()     | get string representation of error code
+ * umqtt_GetConnectedStatus() | determine if connected
+ *
+ * The following are available but you don't need to call these directly,
+ * they are called from umqtt_Run() when needed.
+ *
+ * Function Name              | Description
+ * ---------------------------|------------
+ * umqtt_PingReq()            | send ping request to MQTT broker
+ * umqtt_DecodePacket()       | decode a MQTT packet and perform actions
+ *
+ * Functions you must implement
+ * ----------------------------
+ * These are populated into a @ref umqtt_TransportConfig_t structure and passed
+ * to umqtt_New():
+ *
+ * Function Name      | Description
+ * -------------------|------------
+ * malloc_t()         | memory allocation for packets
+ * free_t()           | free allocated memory
+ * netReadPacket_t()  | read a packet from the network
+ * netWritePacket_t() | write a packet to the network
+ *
+ * Optional functions to implement
+ * -------------------------------
+ * These callback functions are used to notify the application when certain
+ * events occur.  These are populated into a @ref umqtt_Callbacks_t
+ * structure and passed to umqtt_New().  Unimplemented callback functions
+ * can be set to NULL.
+ *
+ * Function Name  | Description
+ * ---------------|------------
+ * ConnackCb_t()  | CONNACK received from broker to acknowledge a CONNECT
+ * PublishCb_t()  | PUBLISH received from broker
+ * PubackCb_t()   | PUBACK received from broker in response to PUBLISH with QoS != 0
+ * SubackCb_t()   | SUBACK received in response to SUBSCRIBE
+ * UnsubackCb_t() | UNSUBACK received in response to UNSUBSCRIBE
+ * PingrespCb_t() | PINGRESP received in response to PINGREQ
+ *
+ * Run loop and timing
+ * -------------------
+ * You must call umqtt_Run() repeatedly from your main run loop.  It is not
+ * required that timing be exact between calls.  You must maintain a
+ * source of millisecond tick values (like a tick timer) and pass the
+ * millisecond ticks to umqtt_Run() each time it is called.  This is how
+ * `umqtt` keeps track of timing for timeouts and retries.
+ *
+ * Not thread safe
+ * ---------------
+ * These functions are not thread safe.  You musn't call them from different
+ * threads unless you provide your own resource lock wrapper(s).
+ *
  */
-
-// TODO: const on parameters
 
 /*
  * MQTT packet types
@@ -91,45 +124,285 @@
 #define UMQTT_CONNECT_FLAG_CLEAN 0x02
 #define UMQTT_CONNECT_FLAG_QOS_SHIFT 3
 
+/*
+ * Defines the retry timeout and number of retries before giving up.
+ */
+#define UMQTT_RETRY_TIMEOUT 5000
+#define UMQTT_RETRIES 10
+
 // error handling convenience
 #define RETURN_IF_ERR(c,e) do{if(c){return (e);}}while(0)
 
-static char *errCodeStrings[] =
+/*
+ * Provide names for all error codes for debug convenience.
+ */
+static const char *errCodeStrings[] =
 {
     "UMQTT_ERR_OK",
-    "UMQTT_ERR_RET_LEN",
     "UMQTT_ERR_PACKET_ERROR",
     "UMQTT_ERR_BUFSIZE",
     "UMQTT_ERR_PARM",
+    "UMQTT_ERR_NETWORK",
+    "UMQTT_ERR_CONNECT_PENDING",
+    "UMQTT_ERR_CONNECTED",
+    "UMQTT_ERR_DISCONNECTED",
+    "UMQTT_ERR_TIMEOUT",
 };
+
+/*
+ * Defines the interal packet buffer structure.  This is a packet header
+ * that is used to track state and does not include the actual MQTT packet
+ * and payload.  This structure is added to the front of the MQTT packet
+ * and is not visible to the client program.
+ */
+typedef struct PktBuf
+{
+    struct PktBuf *next;    // next packet in a list
+    uint16_t packetId;      // packet ID of this packet
+    uint32_t ticks;         // ticks when this packet was last sent
+    unsigned int ttl;       // time-to-live, remaining retries
+} PktBuf_t;
+
+/*
+ * umqtt instance data structure.  This is allocated and populated when
+ * the client calls "New"
+ * @todo consider using the pending packet list to track ping requests
+ * instead of keeping a separate field here
+ */
+typedef struct
+{
+    uint16_t packetId;      // last used packet ID on this instance
+    void *pUser;            // caller supplied data pointer
+    struct PktBuf pktList;  // pending packet list
+    uint32_t ticks;         // ticks when run was last called
+    uint32_t pingTicks;     // ticks when last ping request was sent
+    bool isConnected;       // this client instance is protocol-connected
+    bool connectIsPending;  // connect req was send but waiting for ack
+    uint16_t keepAlive;     // keep alive interval in seconds
+    umqtt_TransportConfig_t *pNet;  // network instance
+    umqtt_Callbacks_t *pCb; // pointer to callbacks
+} umqtt_Instance_t;
+
+
+/*
+ * @internal
+ *
+ * Allocate a new packet
+ *
+ * @param this umqtt instance
+ * @param remainingLength the packet length not including header and
+ * remaining length fields
+ *
+ * This function will allocate a new packet and return a pointer to a buffer
+ * to use for assembling a MQTT packet.  It will add additional length
+ * to account for the required header byte and up to 4 bytes for remaining
+ * length.  It also adds the internal packet tracking structure to the
+ * front of the MQTT packet but this is hidden from the returned pointer.
+ *
+ * @return pointer to uint8_t buffer of sufficient length for MQTT packet,
+ * or NULL
+ */
+static uint8_t *
+newPacket(const umqtt_Instance_t *this, size_t remainingLength)
+{
+    if (!this)
+    {
+        return NULL;
+    }
+    remainingLength += 1 + 4; // 1 hdr byte plus up to 4 len bytes
+    uint8_t *buf = this->pNet->pfnmalloc(remainingLength + sizeof(PktBuf_t));
+    if (buf)
+    {
+        buf += sizeof(PktBuf_t);
+        return buf;
+    }
+    else
+    {
+        return NULL;
+    }
+}
+
+/*
+ * @internal
+ *
+ * Free a packet
+ *
+ * @param this umqtt instance
+ * @param pbuf the MQTT packet that was allocated with newPacket()
+ *
+ * Frees a previously allocated MQTT packet.  Assumes this packet is
+ * not in the pending list.  If it is, then things will go bad.
+ */
+static void
+deletePacket(const umqtt_Instance_t *this, uint8_t *pbuf)
+{
+    if (pbuf && this)
+    {
+        pbuf -= sizeof(PktBuf_t);
+        PktBuf_t *pkt = (PktBuf_t *)pbuf;
+        pkt->next = NULL;
+        this->pNet->pfnfree(pbuf);
+    }
+}
+
+/*
+ * @internal
+ *
+ * Add a packet to the pending packet list.
+ *
+ * @param this umqtt instance
+ * @param pbuf MQTT packet buffer to add to the queue
+ * @param packetId packet ID of this packet
+ * @param ticks tick count when this packet is enqueued
+ *
+ * This function will add the MQTT packet to the list of pending packets.
+ * The caller supplies the packet ID and the current tick count for the
+ * packet.  These are saved with the packet to facilitate lookup later.
+ */
+static void
+enqueuePacket(umqtt_Instance_t *this, uint8_t *pbuf, uint16_t packetId, uint32_t ticks)
+{
+    if (pbuf && this)
+    {
+        pbuf -= sizeof(PktBuf_t);
+        PktBuf_t *pkt = (PktBuf_t *)pbuf;
+        pkt->next = this->pktList.next;
+        this->pktList.next = pkt;
+        pkt->ticks = ticks;
+        pkt->packetId = packetId;
+        pkt->ttl = UMQTT_RETRIES;
+    }
+}
+
+/*
+ * @internal
+ *
+ * Remove a packet from the pending packet list, using the packet ID
+ *
+ * @param this umqtt instance
+ * @param packetId the packet ID of the packet to remove
+ *
+ * Searches the pending packet list/queue for a packet with matching
+ * packet ID.  If found, the packet is delinked from the list and returned
+ * to the caller.
+ *
+ * @return Pointer to the dequeued packet or NULL.
+ */
+static uint8_t *
+dequeuePacketById(umqtt_Instance_t *this, uint16_t packetId)
+{
+    if (!this)
+    {
+        return NULL;
+    }
+    PktBuf_t *pPrev = &this->pktList;
+    PktBuf_t *pPkt = pPrev->next;
+    while (pPkt)
+    {
+        if (packetId == pPkt->packetId)
+        {
+            pPrev->next = pPkt->next;
+            pPkt->next = NULL;
+            uint8_t *buf = (uint8_t *)pPkt;
+            buf += sizeof(PktBuf_t);
+            return buf;
+        }
+        pPrev = pPkt;
+        pPkt = pPkt->next;
+    }
+    return NULL;
+}
+
+/*
+ * @internal
+ *
+ * Remove a packet from the pending packet list, using the MQTT packet type
+ *
+ * @param this umqtt instance
+ * @param type the MQTT packet type to remove
+ *
+ * Searches the pending packet list/queue for a packet with matching
+ * packet type.  If found, the packet is delinked from the list and returned
+ * to the caller.  If there is more than one packet with the same type, it
+ * will only dequeue and return the first one that matches.
+ *
+ * @return Pointer to the dequeued packet or NULL.
+ */
+static uint8_t *
+dequeuePacketByType(umqtt_Instance_t *this, uint8_t type)
+{
+    if (!this)
+    {
+        return NULL;
+    }
+    PktBuf_t *pPrev = &this->pktList;
+    PktBuf_t *pPkt = pPrev->next;
+    while (pPkt)
+    {
+        uint8_t *buf = (uint8_t *)pPkt;
+        buf += sizeof(PktBuf_t);
+        if ((type << 4) == buf[0])
+        {
+            pPrev->next = pPkt->next;
+            pPkt->next = NULL;
+            return buf;
+        }
+        pPrev = pPkt;
+        pPkt = pPkt->next;
+    }
+    return NULL;
+}
+
+/*
+ * @internal
+ *
+ * Removes and frees all packets from the pending packet list.
+ *
+ * @param this umqtt instance
+ */
+static void
+freeAllQueuedPackets(umqtt_Instance_t *this)
+{
+    if (this)
+    {
+        PktBuf_t *pNext = this->pktList.next;
+        while (pNext)
+        {
+            PktBuf_t *pPkt = pNext;
+            pNext = pPkt->next;
+            pPkt->next = NULL;
+            this->pNet->pfnfree(pPkt);
+        }
+    }
+}
 
 /**
  * Get string representing an error code.
  *
  * @param err is the error code to decode
  *
- * @return a human readable string representation of the error code
- *
  * This function is useful for debugging.  It can be used to print
  * a meaningful string for an error code.
+
+ * @return a human readable string representation of the error code
  */
-char *
+const char *
 umqtt_GetErrorString(umqtt_Error_t err)
 {
     return errCodeStrings[err];
 }
 
-/** @internal
+/* @internal
  *
  * Encode length into MQTT remaining length format
  *
  * @param length length to encode
  * @param pEncodeBuf buffer to store encoded length
  *
- * @return the count of bytes that hold the length
- *
  * Does not validate parameters.  Assumes length is valid
  * and buffer is large enough to hold encoded length.
+ *
+ * @return the count of bytes that hold the length
  */
 static uint32_t
 umqtt_EncodeLength(uint32_t length, uint8_t *pEncodeBuf)
@@ -150,19 +423,19 @@ umqtt_EncodeLength(uint32_t length, uint8_t *pEncodeBuf)
     return idx; // return count of bytes
 }
 
-/** @internal
+/* @internal
  *
  * Decode remaining length field from MQTT packet.
  *
  * @param pLength storage to location of decoded length
  * @param pEncodedLength buffer holding the encoded length field
  *
- * @return count of bytes of the encoded length
- *
  * The caller supplies storage for the decoded length through the
  * _pLength_ parameter.  The number of bytes used to hold the encoded
  * length in the packet is returned to the caller.  No parameter
  * validation is performed.
+ *
+ * @return count of bytes of the encoded length
  */
 static uint32_t
 umqtt_DecodeLength(uint32_t *pLength, const uint8_t *pEncodedLength)
@@ -183,625 +456,672 @@ umqtt_DecodeLength(uint32_t *pLength, const uint8_t *pEncodedLength)
     return count;
 }
 
-/** @internal
+/* @internal
  *
  * Encode a data block into an MQTT packet
  *
- * @param pDat pointer to mqtt data block or string to be encoded
- * into a packet
- * @param pBuf pointer to a buffer where the data block will be encoded
+ * @param pInBuf pointer to buffer containing data to encode
+ * @param inBufLen count of bytes in input buffer
+ * @param pOutBuf pointer to a buffer where the data block will be encoded
+ *
+ * This function assumes that the buffer pointed at by _pOutBuf_ is large
+ * enough to hold the encoded data block.  This function will take the data
+ * and length provided and encode it into a buffer as an MQTT data block.
  *
  * @return count of bytes that were encoded
- *
- * This function assumes that the buffer pointed at by _pBuf_ is large
- * enough to hold the encoded data block.
  */
 static uint32_t
-umqtt_EncodeData(const umqtt_Data_t *pDat, uint8_t *pBuf)
+umqtt_EncodeData(const uint8_t *pInBuf, uint32_t inBufLen, uint8_t *pOutBuf)
 {
-    *pBuf++ = pDat->len >> 8;
-    *pBuf++ = pDat->len & 0xFF;
-    memcpy(pBuf, pDat->data, pDat->len);
-    return pDat->len + 2;
+    *pOutBuf++ = inBufLen >> 8;
+    *pOutBuf++ = inBufLen & 0xFF;
+    memcpy(pOutBuf, pInBuf, inBufLen);
+    return inBufLen + 2;
 }
 
 /**
- * Build an MQTT CONNECT packet.
+ * Initiate MQTT protocol Connect
  *
- * @param h the umqtt instance handle
- * @param pOutBuf points at the data buffer to hold the encoded CONNECT packet
- * @param pOptions points at structure holding the connect options
+ * @param h umqtt instance handle from umqtt_New()
+ * @param cleanSession true to establish new session, false to resume old session
+ * @param willRetain true if published will message should be retained
+ * @param willQos the QoS level to be used for the will message (if used)
+ * @param keepAlive the keep alive interval in seconds
+ * @param clientId the name of the MQTT client to use for the session
+ * @param willTopic optional topic name for will, or NULL
+ * @param willPayload optional will payload, or NULL
+ * @param willPayloadLen length of the will payload message
+ * @param username optional authentication user name, or NULL
+ * @param password optional authentication password, or NULL
  *
  * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
  *
- * The connect options found in the argument _pOptions_ will be encoded into
- * an MQTT CONNECT packet and stored in the buffer specified by _pOutBuf_.
- * The caller must allocate the buffer space needed to hold the packet.
+ * This function will create a MQTT Connect packet and attempt to send it
+ * to the MQTT broker.  The network connection to the MQTT server port should
+ * already be established.  When the function returns, the Connect packet
+ * has been sent or there was an error.  Upon return, the MQTT connection
+ * is pending, it is not yet established.  The connection is not established
+ * until the MQTT broker sends a Connack packet, which can be detected by
+ * either using the Connack callback function, or when umqtt_GetConnectedStatus()
+ * returns UMQTT_ERR_CONNECTED.
  *
- * The encoded packet is returned to the caller through the output buffer
- * _pOutBuf_.  The data will be written to ->data and the length will be
- * written to the ->len field of the caller-supplied _pOutBuf_ output buffer
- * structure.
+ * Possible return codes:
  *
- * __Length calculation feature__
- *
- * By calling this function with a NULL instance handle (_h_ is NULL), then
- * the required length of the packet will be calculated but no packet data
- * is written to the output buffer.  The caller can use this feature to
- * discover how much space is required for the CONNECT packet before
- * allocating buffer space.  The required space will be returned in the
- * length field of the _pOutBuf_ output buffer argument.
+ * Code                      | Reason
+ * --------------------------|-------
+ * UMQTT_ERR_OK              | Connect packet was transmitted
+ * UMQTT_ERR_PARM            | detected an error in a function parameter
+ * UMQTT_ERR_BUFSIZE         | memory allocation failed
+ * UMQTT_ERR_NETWORK         | error writing packet to network
+ * UMQTT_ERR_CONNECTED       | MQTT connection is already established
+ * UMQTT_ERR_CONNECT_PENDING | MQTT connection is already in progress
  *
  * __Example__
  *
  * ~~~~~~~~.c
  * umqtt_Handle_t h; // previously acquired instance handle
+ * char clientName[] = "myMqttClient";
+ * char willTopic[] = "myWillTopic";
+ * uint8_t willPayload[] = (uint8_t *)"myWillMessage";
  *
- * // create and populate basic connect options
- * umqtt_Connection_Options_t opts = CONNECT_OPTIONS_INITIALIZER;
- * opts.keepAlive = 30; // 30 seconds
- * UMQTT_INIT_DATA_STR(opts.clientId, "myClientId"); // client ID
- *
- * // buffer to store output packet
- * static uint8_t pktbuf[BUF_SIZE];
- * umqtt_Data_t outbuf;
- * UMATT_INIT_DATA_STATIC_BUF(outbuf, pktbuf);
- *
- * // build the CONNECT packet
  * umqtt_Error_t err;
- * err = umqtt_BuildConnect(h, &outbuf, &opts);
- * if (err == UMQTT_ERR_OK)
+ * err = umqtt_Connect(h, true, false, 0, 30, // clean session, 30 secs keep alive
+ *                     clientName, willTopic,
+ *                     willPayload, strlen(willPayload),
+ *                     NULL, NULL); // no username or password
+ * if (err != UMQTT_ERR_OK)
  * {
- *     // send packet using your network method
- *     // packet data is in outbuf.data, length is in outbuf.len
- *     mynet_send_function(outbuf.data, outbuf.len);
+ *     // handle error
  * }
  * else
  * {
- *     // handle build error
+ *     // connect is in progress
  * }
  * ~~~~~~~~
  */
 umqtt_Error_t
-umqtt_BuildConnect(umqtt_Handle_t h, umqtt_Data_t *pOutBuf,
-                   const umqtt_Connect_Options_t *pOptions)
+umqtt_Connect(umqtt_Handle_t h,
+              bool cleanSession, bool willRetain, uint8_t willQos,
+              uint16_t keepAlive, const char *clientId,
+              const char *willTopic, const uint8_t *willPayload, uint32_t willPayloadLen,
+              const char *username, const char *password)
 {
     uint8_t connectFlags = 0;
     uint32_t idx = 0;
+    umqtt_Instance_t *this = h;
 
     // initial parameter check
-    RETURN_IF_ERR((pOutBuf == NULL) || (pOptions == NULL), UMQTT_ERR_PARM);
+    RETURN_IF_ERR((this == NULL) || (clientId == NULL), UMQTT_ERR_PARM);
+    size_t clientIdLen = strlen(clientId);
+    size_t willTopicLen = willTopic ? strlen(willTopic) : 0;
+    size_t usernameLen = username ? strlen(username) : 0;
+    size_t passwordLen = password ? strlen(password) : 0;
+
+    // already connected
+    RETURN_IF_ERR(this->isConnected, UMQTT_ERR_CONNECTED);
+    RETURN_IF_ERR(this->connectIsPending, UMQTT_ERR_CONNECT_PENDING);
 
     // calculate the "remaining length" for the packet based on
     // the various input fields.
-    RETURN_IF_ERR(pOptions->clientId.len == 0, UMQTT_ERR_PARM);
-    uint16_t remainingLength = 10 // variable header
-                             + 2 + pOptions->clientId.len;
-    if (pOptions->willTopic.len)
+    RETURN_IF_ERR(clientIdLen == 0, UMQTT_ERR_PARM);
+    uint16_t remainingLength = 10 + 2 + clientIdLen;
+    if (willTopicLen)
     {
         connectFlags |= UMQTT_CONNECT_FLAG_WILL;
-        remainingLength += 2 + pOptions->willTopic.len;
+        remainingLength += 2 + willTopicLen;
         // if there is a will topic there should be a will message
-        RETURN_IF_ERR(pOptions->willMessage.len == 0, UMQTT_ERR_PARM);
-        remainingLength += 2 + pOptions->willMessage.len;
+        RETURN_IF_ERR(willPayload == NULL, UMQTT_ERR_PARM);
+        remainingLength += 2 + willPayloadLen;
     }
-    if (pOptions->username.len)
+    if (usernameLen)
     {
         connectFlags |= UMQTT_CONNECT_FLAG_USER;
-        remainingLength += 2 + pOptions->username.len;
+        remainingLength += 2 + usernameLen;
     }
-    if (pOptions->password.len)
+    if (passwordLen)
     {
         connectFlags |= UMQTT_CONNECT_FLAG_PASS;
-        remainingLength += 2 + pOptions->password.len;
+        remainingLength += 2 + passwordLen;
     }
 
-    // if handle is NULL but other parameters are okay then caller
-    // is asking for computed length of packet and no other action
-    if (h == NULL)
+    // allocate buffer needed for encode
+    uint8_t *buf = newPacket(this, remainingLength);
+    RETURN_IF_ERR(buf == NULL, UMQTT_ERR_BUFSIZE);
+
+    // allocate second buffer just to hold packet timeout
+    uint8_t *tmoBuf = newPacket(this, 0);
+    if (tmoBuf == NULL)
     {
-        // use a dummy buf to encode the remaining length in order
-        // to find out how many bytes for the length field
-        uint8_t encBuf[4];
-        uint32_t byteCount = umqtt_EncodeLength(remainingLength, encBuf);
-
-        // return total packet length
-        pOutBuf->len = remainingLength + byteCount + 1;
-        return UMQTT_ERR_RET_LEN;
+        deletePacket(this, buf);
+        return UMQTT_ERR_BUFSIZE;
     }
-
-    // make sure valid data buffer
-    RETURN_IF_ERR((pOutBuf->data == NULL) || (pOutBuf->len < 12), UMQTT_ERR_PARM);
 
     // encode the remaining length into the appropriate position in the buffer
-    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &pOutBuf->data[1]);
+    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &buf[1]);
 
-    // check that the caller provided buffer is going to be big enough
-    // for the rest of the packet
-    RETURN_IF_ERR((1 + lenSize + remainingLength) > pOutBuf->len, UMQTT_ERR_BUFSIZE);
-
-    // assign length of returned buffer
-    pOutBuf->len = 1 + lenSize + remainingLength;
+    // compute final length of packet with all data and headers
+    remainingLength += 1 + lenSize;
 
     // encode the packet type and adjust index ahead to
     // point at variable header
-    uint8_t *buf = pOutBuf->data;
     buf[0] = UMQTT_TYPE_CONNECT << 4;
     idx = 1 + lenSize;
+    tmoBuf[0] = buf[0];
 
     // encode protocol name
-    uint8_t protocolNameStr[4] = "MQTT";
-    umqtt_Data_t protocolName = { 4, protocolNameStr };
-    idx += umqtt_EncodeData(&protocolName, &buf[idx]);
+    const uint8_t *protocolName = (const uint8_t *)"MQTT";
+    idx += umqtt_EncodeData(protocolName, 4, &buf[idx]);
 
     // protocol level, connect flags and keepalive
-    connectFlags |= pOptions->willRetain ? UMQTT_CONNECT_FLAG_WILL_RETAIN : 0;
-    connectFlags |= pOptions->cleanSession ? UMQTT_CONNECT_FLAG_CLEAN : 0;
-    connectFlags |= (pOptions->qos << UMQTT_CONNECT_FLAG_QOS_SHIFT) & UMQTT_CONNECT_FLAG_WILL_QOS;
+    connectFlags |= willRetain ? UMQTT_CONNECT_FLAG_WILL_RETAIN : 0;
+    connectFlags |= cleanSession ? UMQTT_CONNECT_FLAG_CLEAN : 0;
+    connectFlags |= (willQos << UMQTT_CONNECT_FLAG_QOS_SHIFT) & UMQTT_CONNECT_FLAG_WILL_QOS;
     buf[idx++] = 4;
     buf[idx++] = connectFlags;
-    buf[idx++] = pOptions->keepAlive >> 8;
-    buf[idx++] = pOptions->keepAlive & 0xFF;
+    buf[idx++] = keepAlive >> 8;
+    buf[idx++] = keepAlive & 0xFF;
+    this->keepAlive = keepAlive;
 
     // client id
-    RETURN_IF_ERR(pOptions->clientId.data == NULL, UMQTT_ERR_PARM);
-    idx += umqtt_EncodeData(&pOptions->clientId, &buf[idx]);
+    idx += umqtt_EncodeData((const uint8_t *)clientId, clientIdLen, &buf[idx]);
 
     // will topic and message
-    if (pOptions->willTopic.len)
+    if (willTopicLen)
     {
         // check data pointers
-        RETURN_IF_ERR(pOptions->willTopic.data == NULL, UMQTT_ERR_PARM);
-        RETURN_IF_ERR(pOptions->willMessage.data == NULL, UMQTT_ERR_PARM);
-        idx += umqtt_EncodeData(&pOptions->willTopic, &buf[idx]);
-        idx += umqtt_EncodeData(&pOptions->willMessage, &buf[idx]);
+        idx += umqtt_EncodeData((const uint8_t *)willTopic, willTopicLen, &buf[idx]);
+        idx += umqtt_EncodeData(willPayload, willPayloadLen, &buf[idx]);
     }
 
     // username
-    if (pOptions->username.len)
+    if (usernameLen)
     {
-        RETURN_IF_ERR(pOptions->username.data == NULL, UMQTT_ERR_PARM);
-        idx += umqtt_EncodeData(&pOptions->username, &buf[idx]);
+        idx += umqtt_EncodeData((const uint8_t *)username, usernameLen, &buf[idx]);
     }
 
     // password
-    if (pOptions->password.len)
+    if (passwordLen)
     {
-        RETURN_IF_ERR(pOptions->password.data == NULL, UMQTT_ERR_PARM);
-        idx += umqtt_EncodeData(&pOptions->password, &buf[idx]);
+        idx += umqtt_EncodeData((const uint8_t *)password, passwordLen, &buf[idx]);
+    }
+
+    // attempt to send the packet on the network
+    int len = this->pNet->pfnNetWritePacket(this->pNet->hNet, buf, remainingLength, false);
+    // no matter what, we dont need this packet any more so free it
+    deletePacket(this, buf);
+
+    // check for error sending on the network
+    if (len != remainingLength)
+    {
+        // also need to delete the timeout packet since we dont need it now
+        deletePacket(this, tmoBuf);
+        return UMQTT_ERR_NETWORK; // network error
+    }
+
+    // if we make it here then we are attempting a connection and dont know
+    // yet if there is a connection.  Enqueue the timeout packet for the
+    // purpose of tracking the timeout until we get a CONNACK.
+    // This packet doesnt have a packet ID so just use 0
+    enqueuePacket(this, tmoBuf, 0, this->ticks);
+    this->connectIsPending = true;
+
+    // return success - connect attempt is in flight
+    return UMQTT_ERR_OK;
+}
+
+/**
+ * Disconnect MQTT protocol
+ *
+ * @param h umqtt instance handle from umqtt_New()
+ *
+ * @return UMQTT_ERR_OK or an error code
+ *
+ * This function attempts to send a MQTT protocol disconnect packet, frees
+ * up all pending packets and marks the instance as disconnected.
+ */
+umqtt_Error_t
+umqtt_Disconnect(umqtt_Handle_t h)
+{
+    umqtt_Instance_t *this = h;
+    static const uint8_t disconnectPacket[2] = { UMQTT_TYPE_DISCONNECT << 4, 0 };
+
+    // initial parameter check
+    RETURN_IF_ERR(h == NULL, UMQTT_ERR_PARM);
+
+    // clean out packet queue
+    freeAllQueuedPackets(this);
+
+    // attempt to send disconnect packet
+    int len = this->pNet->pfnNetWritePacket(this->pNet->hNet, disconnectPacket,
+                                            2, false);
+
+    // clear connection status no matter what
+    this->isConnected = false;
+    this->connectIsPending = false;
+
+    if (len != 2)
+    {
+        return UMQTT_ERR_NETWORK; // network error
     }
 
     return UMQTT_ERR_OK;
 }
 
 /**
- * Build an MQTT PUBLISH packet.
+ * Send MQTT protocol Publish packet
  *
- * @param h the umqtt instance handle
- * @param pOutBuf points at the data buffer to hold the encoded PUBLISH packet
- * @param pOptions points at structure holding the publish options
+ * @param h umqtt instance handle from umqtt_New()
+ * @param topic topic name to publish
+ * @param payload payload or message for the topic (can be NULL)
+ * @param payloadLen number of bytes in the payload
+ * @param qos QoS (quality of service) level for this topic
+ * @param shouldRetain true if MQTT broker should retain this topic
+ * @param pId pointer to storage for assigned packet ID (optional)
  *
  * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
  *
- * The publish options found in the argument _pOptions_ will be encoded into
- * an MQTT PUBLISH packet and stored in the buffer specified by _pOutBuf_.
- * The caller must allocate the buffer space needed to hold the packet.
+ * This function is used to publish a topic with an optional payload.
+ * A publish packet will be assembled and sent to the connected UMQTT
+ * broker.  If the QoS > 0 then the packet will be held and resent as
+ * needed until an acknowledgment is received.  If this happens, then the
+ * Publish packet will have a packet ID.  The _pId_ parameter can be used
+ * to get the packet ID if needed.  Otherwise, this parameter can be set
+ * to NULL.  If the QoS is 0, then there is no packet ID.
  *
- * The encoded packet is returned to the caller through the output buffer
- * _pOutBuf_.  The data will be written to ->data and the length will be
- * written to the ->len field of the caller-supplied _pOutBuf_ output buffer
- * structure.
+ * If a callback function was provided for Puback, then the Puback callback
+ * will be called when the publish packet is acknowledged.
  *
- * __Length calculation feature__
+ * A payload is not required.  MQTT can publish only a topic name with
+ * no payload.  If a payload is not used then the parameter can be set
+ * to NULL.  The payload can be binary data and not necessarily a string.
  *
- * By calling this function with a NULL instance handle (_h_ is NULL), then
- * the required length of the packet will be calculated but no packet data
- * is written to the output buffer.  The caller can use this feature to
- * discover how much space is required for the PUBLISH packet before
- * allocating buffer space.  The required space will be returned in the
- * length field of the _pOutBuf_ output buffer argument.
+ * @note At this time, the umqtt library does not support QoS level 2
  *
  * __Example__
  *
  * ~~~~~~~~.c
  * umqtt_Handle_t h; // previously acquired instance handle
+ * char topicName[] = "myTopic";
+ * uint8_t payload[] = (uint8_t *)"myPayloadMessage";
+ * uint16_t msgId;
  *
- * // create default publish options
- * umqtt_Publish_Options_t opts = PUBLISH_OPTIONS_INITIALIZER;
- * // set retain flag and set topic and message
- * opts.retain = true;
- * UMQTT_INIT_DATA_STR(opts.topic, "myTopic");
- * UMQTT_INIT_DATA_STR(opts.message, "myMessage");
- *
- * // buffer to store output packet
- * static uint8_t pktbuf[BUF_SIZE];
- * umqtt_Data_t outbuf;
- * UMATT_INIT_DATA_STATIC_BUF(outbuf, pktbuf);
- *
- * // build the PUBLISH packet
  * umqtt_Error_t err;
- * err = umqtt_BuildPublish(h, &outbuf, &opts);
+ * err = umqtt_Publish(h, topicName, payload, strlen(payload),
+ *                     1, true, *msgId);
  * if (err == UMQTT_ERR_OK)
  * {
- *     // send packet using your network method
- *     // packet data is in outbuf.data, length is in outbuf.len
- *     mynet_send_function(outbuf.data, outbuf.len);
+ *     // Publish packet has been sent with QoS 1
+ *     // Packet is pending acknowledgment
+ *     // msgId now contains the packet ID that was used
  * }
- * else
+ * else // error occurred
  * {
- *     // handle build error
+ *     // handle publish error
  * }
  * ~~~~~~~~
  */
 umqtt_Error_t
-umqtt_BuildPublish(umqtt_Handle_t h, umqtt_Data_t *pOutBuf,
-                   const umqtt_Publish_Options_t *pOptions)
+umqtt_Publish(umqtt_Handle_t h,
+              const char *topic, const uint8_t *payload, uint32_t payloadLen,
+              uint32_t qos, bool shouldRetain, uint16_t *pId)
 {
     uint8_t flags = 0;
     uint32_t idx = 0;
+    umqtt_Instance_t *this = h;
 
     // initial parameter check
-    RETURN_IF_ERR((pOutBuf == NULL) || (pOptions == NULL), UMQTT_ERR_PARM);
-    RETURN_IF_ERR(pOptions->topic.len == 0, UMQTT_ERR_PARM);
+    RETURN_IF_ERR((this == NULL) || (topic == NULL), UMQTT_ERR_PARM);
+    size_t topicLen = strlen(topic);
+    RETURN_IF_ERR((payloadLen != 0) && (payload == NULL), UMQTT_ERR_PARM);
+
+    RETURN_IF_ERR(!this->isConnected, UMQTT_ERR_DISCONNECTED);
 
     // calculate the "remaining length" for the packet based on
     // the various input fields.
-    uint16_t remainingLength = (pOptions->qos ? 2 : 0) // packet id
-                             + 2 + pOptions->topic.len;
-    if (pOptions->message.len)
-    {
-        remainingLength += 2 + pOptions->message.len;
-    }
+    uint16_t remainingLength = (qos ? 2 : 0) + 2 + topicLen;
+    remainingLength += payload ? 2 + payloadLen: 0;
 
-    // if handle is NULL but other parameters are okay then caller
-    // is asking for computed length of packet and no other action
-    if (h == NULL)
-    {
-        // use a dummy buf to encode the remaining length in order
-        // to find out how many bytes for the length field
-        uint8_t encBuf[4];
-        uint32_t byteCount = umqtt_EncodeLength(remainingLength, encBuf);
-
-        // return total packet length
-        pOutBuf->len = remainingLength + byteCount + 1;
-        return UMQTT_ERR_RET_LEN;
-    }
-
-    // get instance data from handle
-    umqtt_Instance_t *pInst = h;
-
-    // make sure valid data buffer
-    RETURN_IF_ERR((pOutBuf->data == NULL) || (pOutBuf->len < 5), UMQTT_ERR_PARM);
+    // allocate buffer needed to encode packet
+    uint8_t *buf = newPacket(this, remainingLength);
+    RETURN_IF_ERR(buf == NULL, UMQTT_ERR_BUFSIZE);
 
     // encode the remaining length into the appropriate position in the buffer
-    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &pOutBuf->data[1]);
+    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &buf[1]);
 
-    // check that the caller provide buffer is going to be big enough
-    // for the rest of the packet
-    RETURN_IF_ERR((1 + lenSize + remainingLength) > pOutBuf->len, UMQTT_ERR_BUFSIZE);
-
-    // assign length of returned buffer
-    pOutBuf->len = 1 + lenSize + remainingLength;
+    // compute final length of packet with all data and headers
+    remainingLength += 1 + lenSize;
 
     // encode the packet type and adjust index ahead to
     // point at variable header
-    uint8_t *buf = pOutBuf->data;
     buf[0] = UMQTT_TYPE_PUBLISH << 4;
     idx = 1 + lenSize;
 
     // header flags
-    flags |= pOptions->dup ? UMQTT_FLAG_DUP : 0;
-    flags |= pOptions->retain ? UMQTT_FLAG_RETAIN : 0;
-    flags |= (pOptions->qos << UMQTT_FLAG_QOS_SHIFT) & UMQTT_FLAG_QOS;
+    // @todo dup flag needs to be set by retransmit
+//    flags |= isDup ? UMQTT_FLAG_DUP : 0;
+    flags |= shouldRetain ? UMQTT_FLAG_RETAIN : 0;
+    flags |= (qos << UMQTT_FLAG_QOS_SHIFT) & UMQTT_FLAG_QOS;
     buf[0] |= flags;
 
     // topic name
-    RETURN_IF_ERR(pOptions->topic.data == NULL, UMQTT_ERR_PARM);
-    idx += umqtt_EncodeData(&pOptions->topic, &buf[idx]);
+    idx += umqtt_EncodeData((const uint8_t *)topic, topicLen, &buf[idx]);
 
     // if QOS then also need packet ID
-    if (pOptions->qos != 0)
+    if (qos != 0)
     {
-        ++pInst->packetId;
-        if (pInst->packetId == 0)
+        ++this->packetId;
+        if (this->packetId == 0)
         {
-            pInst->packetId = 1;
+            this->packetId = 1;
         }
-        buf[idx++] = pInst->packetId >> 8;
-        buf[idx++] = pInst->packetId & 0xFF;
+        buf[idx++] = this->packetId >> 8;
+        buf[idx++] = this->packetId & 0xFF;
+        if (pId)
+        {
+            *pId = this->packetId;
+        }
+    }
+    else
+    {
+        if (pId)
+        {
+            *pId = 0;
+        }
     }
 
     // payload message
-    if (pOptions->message.len)
+    if (payloadLen)
     {
-        // check data pointers
-        RETURN_IF_ERR(pOptions->message.data == NULL, UMQTT_ERR_PARM);
-        idx += umqtt_EncodeData(&pOptions->message, &buf[idx]);
+        idx += umqtt_EncodeData(payload, payloadLen, &buf[idx]);
+    }
+
+    int len = this->pNet->pfnNetWritePacket(this->pNet->hNet, buf, remainingLength, false);
+    if (len == remainingLength)
+    {
+        // if qos is non-zero then we need to hang on to the packet until
+        // it is acked, so save the packetId and put it in the wait list
+        if (qos != 0)
+        {
+            enqueuePacket(this, buf, this->packetId, this->ticks);
+        }
+        else
+        {
+            deletePacket(this, buf);
+        }
+    }
+    else
+    {
+        deletePacket(this, buf);
+        return UMQTT_ERR_NETWORK; // network error
     }
 
     return UMQTT_ERR_OK;
 }
 
 /**
- * Build an MQTT SUBSCRIBE packet.
+ * Subscribe to topics.
  *
- * @param h the umqtt instance handle
- * @param pOutBuf points at the data buffer to hold the encoded SUBSCRIBE packet
- * @param pOptions points at structure holding the subscribe options
+ * @param h umqtt instance handle from umqtt_New()
+ * @param count number of topics in the list of topics to subscribe
+ * @param topics array of topic names to subscribe
+ * @param qoss array of QoS values to use for subscribed topics
+ * @param pId pointer to storage for assigned packet ID (optional)
  *
  * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
  *
- * The subscribe options found in the argument _pOptions_ will be encoded into
- * an MQTT SUBSCRIBE packet and stored in the buffer specified by _pOutBuf_.
- * The caller must allocate the buffer space needed to hold the packet.
+ * This function is used to send a subscribe request to an MQTT broker.
+ * It can be used to subscribe to one or more topics at one time.  Each
+ * subscribed topic can be assigned a QoS level.
  *
- * The encoded packet is returned to the caller through the output buffer
- * _pOutBuf_.  The data will be written to ->data and the length will be
- * written to the ->len field of the caller-supplied _pOutBuf_ output buffer
- * structure.
+ * A subscribe packet will be held pending until it is acknowledged by the
+ * MQTT broker.  If the caller provided the _pId_ parameter, then the packet
+ * ID will be saved for the caller.  If the caller does not need the packet
+ * ID, then _pId_ parameter can be NULL.
  *
- * __Length calculation feature__
- *
- * By calling this function with a NULL instance handle (_h_ is NULL), then
- * the required length of the packet will be calculated but no packet data
- * is written to the output buffer.  The caller can use this feature to
- * discover how much space is required for the SUBSCRIBE packet before
- * allocating buffer space.  The required space will be returned in the
- * length field of the _pOutBuf_ output buffer argument.
+ * If the caller provided a Suback callback function, then it will be
+ * notified when the subscribe request is acknowledged.
  *
  * __Example__
  *
  * ~~~~~~~~.c
  * umqtt_Handle_t h; // previously acquired instance handle
+ * char *topics[] = { "topic1", "topic2" };
+ * uint8_t qoss[] = { 0, 1 };
+ * uint16_t msgId;
  *
- * // create default subscribe options
- * umqtt_Subscribe_Options_t opts = SUBSCRIBE_OPTIONS_INITIALIZER;
- *
- * // subscribe needs an array of topics and array of QoS values
- * // create array for one topic and qos
- * umqtt_Data_t topics[1];
- * uint8_t qoss[1];
- *
- * // set topic and qos, then load into options structure
- * UMQTT_INIT_DATA_STR(topics[0], "mySubscribeTopic");
- * qoss[0] = 0; // QoS level 0
- * opts.pTopics = topics;
- * opts.pQos = qoss;
- * opts.count = 1; // number of topics in array
- *
- * // buffer to store output packet
- * static uint8_t pktbuf[BUF_SIZE];
- * umqtt_Data_t outbuf;
- * UMATT_INIT_DATA_STATIC_BUF(outbuf, pktbuf);
- *
- * // build the SUBSCRIBE packet
  * umqtt_Error_t err;
- * err = umqtt_BuildSubscribe(h, &outbuf, &opts);
+ * err = umqtt_Subscribe(h, 2, topics, qoss, &msgId);
  * if (err == UMQTT_ERR_OK)
  * {
- *     // send packet using your network method
- *     // packet data is in outbuf.data, length is in outbuf.len
- *     mynet_send_function(outbuf.data, outbuf.len);
+ *     // Subscribe packet has been sent with requested topics
+ *     // Packet is pending acknowledgment
+ *     // msgId now contains the packet ID that was used
  * }
- * else
+ * else // error occurred
  * {
- *     // handle build error
+ *     // handle subscribe error
  * }
  * ~~~~~~~~
  */
 umqtt_Error_t
-umqtt_BuildSubscribe(umqtt_Handle_t h, umqtt_Data_t *pOutBuf, umqtt_Subscribe_Options_t *pOptions)
+umqtt_Subscribe(umqtt_Handle_t h,
+                uint32_t count, const char *topics[], uint8_t qoss[],
+                uint16_t *pId)
 {
     uint32_t idx = 0;
+    umqtt_Instance_t *this = h;
 
     // initial parameter check
-    RETURN_IF_ERR((pOutBuf == NULL) || (pOptions == NULL), UMQTT_ERR_PARM);
-    RETURN_IF_ERR(pOptions->pTopics == NULL, UMQTT_ERR_PARM);
-    RETURN_IF_ERR(pOptions->pQos == NULL, UMQTT_ERR_PARM);
-    RETURN_IF_ERR(pOptions->count == 0, UMQTT_ERR_PARM);
+    RETURN_IF_ERR((this == NULL), UMQTT_ERR_PARM);
+    RETURN_IF_ERR((count == 0), UMQTT_ERR_PARM);
+    RETURN_IF_ERR(topics == NULL, UMQTT_ERR_PARM);
+    RETURN_IF_ERR(qoss == NULL, UMQTT_ERR_PARM);
+
+    RETURN_IF_ERR(!this->isConnected, UMQTT_ERR_DISCONNECTED);
 
     // calculate the "remaining length" for the packet based on
     // the various input fields.
     uint16_t remainingLength = 2; // packet id
-    for (uint32_t i = 0; i < pOptions->count; i++)
+    for (uint32_t i = 0; i < count; i++)
     {
-        RETURN_IF_ERR(pOptions->pTopics[i].len == 0, UMQTT_ERR_PARM);
-        RETURN_IF_ERR(pOptions->pTopics[i].data == NULL, UMQTT_ERR_PARM);
-        RETURN_IF_ERR(pOptions->pQos[i] > 2, UMQTT_ERR_PARM);
+        RETURN_IF_ERR(topics[i] == NULL, UMQTT_ERR_PARM);
+        RETURN_IF_ERR(qoss[i] > 2, UMQTT_ERR_PARM);
         remainingLength += 2 + 1; // topic length field plus qos
-        remainingLength += pOptions->pTopics[i].len;
+        remainingLength += strlen(topics[i]);
     }
 
-    // if handle is NULL but other parameters are okay then caller
-    // is asking for computed length of packet and no other action
-    if (h == NULL)
-    {
-        // use a dummy buf to encode the remaining length in order
-        // to find out how many bytes for the length field
-        uint8_t encBuf[4];
-        uint32_t byteCount = umqtt_EncodeLength(remainingLength, encBuf);
-
-        // return total packet length
-        pOutBuf->len = remainingLength + byteCount + 1;
-        return UMQTT_ERR_RET_LEN;
-    }
-
-    // get instance data from handle
-    umqtt_Instance_t *pInst = h;
-
-    // make sure valid data buffer
-    RETURN_IF_ERR((pOutBuf->data == NULL) || (pOutBuf->len < 8), UMQTT_ERR_PARM);
+    // allocate buffer needed to encode packet
+    uint8_t *buf = newPacket(this, remainingLength);
+    RETURN_IF_ERR(buf == NULL, UMQTT_ERR_BUFSIZE);
 
     // encode the remaining length into the appropriate position in the buffer
-    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &pOutBuf->data[1]);
+    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &buf[1]);
 
-    // check that the caller provide buffer is going to be big enough
-    // for the rest of the packet
-    RETURN_IF_ERR((1 + lenSize + remainingLength) > pOutBuf->len, UMQTT_ERR_BUFSIZE);
-
-    // assign length of returned buffer
-    pOutBuf->len = 1 + lenSize + remainingLength;
+    // compute final length of packet with all data and headers
+    remainingLength += 1 + lenSize;
 
     // encode the packet type and adjust index ahead to
     // point at variable header
-    uint8_t *buf = pOutBuf->data;
     buf[0] = (UMQTT_TYPE_SUBSCRIBE << 4) | 0x02;
     idx = 1 + lenSize;
 
     // packet id
-    ++pInst->packetId;
-    if (pInst->packetId == 0)
+    ++this->packetId;
+    if (this->packetId == 0)
     {
-        pInst->packetId = 1;
+        this->packetId = 1;
     }
-    buf[idx++] = pInst->packetId >> 8;
-    buf[idx++] = pInst->packetId & 0xFF;
+    buf[idx++] = this->packetId >> 8;
+    buf[idx++] = this->packetId & 0xFF;
+    if (pId)
+    {
+        *pId = this->packetId;
+    }
 
     // encode each topic in topic array provided by caller
-    for (uint32_t i = 0; i < pOptions->count; i++)
+    for (uint32_t i = 0; i < count; i++)
     {
-        idx += umqtt_EncodeData(&pOptions->pTopics[i], &buf[idx]);
-        buf[idx++] = pOptions->pQos[i];
+        idx += umqtt_EncodeData((const uint8_t *)topics[i], strlen(topics[i]), &buf[idx]);
+        buf[idx++] = qoss[i];
+    }
+
+    int len = this->pNet->pfnNetWritePacket(this->pNet->hNet, buf, remainingLength, false);
+    if (len == remainingLength)
+    {
+        // need to save the packet to wait for ack
+        enqueuePacket(this, buf, this->packetId, this->ticks);
+    }
+    else
+    {
+        deletePacket(this, buf);
+        return UMQTT_ERR_NETWORK; // network error
     }
 
     return UMQTT_ERR_OK;
 }
 
 /**
- * Build an MQTT UNSUBSCRIBE packet.
+ * Unsubscribe from topics.
  *
- * @param h the umqtt instance handle
- * @param pOutBuf points at the data buffer to hold the encoded UNSUBSCRIBE packet
- * @param pOptions points at structure holding the unsubscribe options
+ * @param h umqtt instance handle from umqtt_New()
+ * @param count count of topics in topic list
+ * @param topics array of topic names to unsubscribe
+ * @param pId pointer to storage for assigned packet ID (optional)
  *
  * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
  *
- * The subscribe options found in the argument _pOptions_ will be encoded into
- * an MQTT UNSUBSCRIBE packet and stored in the buffer specified by _pOutBuf_.
- * The caller must allocate the buffer space needed to hold the packet.
+ * This function is used to send an unsubscribe request to an MQTT broker.
+ * It can be used to unsubscribe from one or more topics at one time.
  *
- * The encoded packet is returned to the caller through the output buffer
- * _pOutBuf_.  The data will be written to ->data and the length will be
- * written to the ->len field of the caller-supplied _pOutBuf_ output buffer
- * structure.
+ * An unsubscribe packet will be held pending until it is acknowledged by the
+ * MQTT broker.  If the caller provided the _pId_ parameter, then the packet
+ * ID will be saved for the caller.  If the caller does not need the packet
+ * ID, then _pId_ parameter can be NULL.
  *
- * __Length calculation feature__
- *
- * By calling this function with a NULL instance handle (_h_ is NULL), then
- * the required length of the packet will be calculated but no packet data
- * is written to the output buffer.  The caller can use this feature to
- * discover how much space is required for the UNSUBSCRIBE packet before
- * allocating buffer space.  The required space will be returned in the
- * length field of the _pOutBuf_ output buffer argument.
+ * If the caller provided a Unsuback callback function, then it will be
+ * notified when the unsubscribe request is acknowledged.
  *
  * __Example__
  *
  * ~~~~~~~~.c
  * umqtt_Handle_t h; // previously acquired instance handle
+ * char *topics[] = { "topic1", "topic2" };
+ * uint16_t msgId;
  *
- * // create default unsubscribe options
- * umqtt_Unsubscribe_Options_t opts = UNSUBSCRIBE_OPTIONS_INITIALIZER;
- *
- * // unsubscribe needs an array of topics
- * // create array of two topics
- * umqtt_Data_t topics[2];
- *
- * // set two topics, then load into options structure
- * UMQTT_INIT_DATA_STR(topics[0], "myUnsubscribeTopic1");
- * UMQTT_INIT_DATA_STR(topics[1], "myUnsubscribeTopic2");
- * opts.pTopics = topics;
- * opts.count = 2; // number of topics in array
- *
- * // buffer to store output packet
- * static uint8_t pktbuf[BUF_SIZE];
- * umqtt_Data_t outbuf;
- * UMATT_INIT_DATA_STATIC_BUF(outbuf, pktbuf);
- *
- * // build the UNSUBSCRIBE packet
  * umqtt_Error_t err;
- * err = umqtt_BuildUnsubscribe(h, &outbuf, &opts);
+ * err = umqtt_Unsubscribe(h, 2, topics, &msgId);
  * if (err == UMQTT_ERR_OK)
  * {
- *     // send packet using your network method
- *     // packet data is in outbuf.data, length is in outbuf.len
- *     mynet_send_function(outbuf.data, outbuf.len);
+ *     // Unsubscribe packet has been sent with topic list
+ *     // Packet is pending acknowledgment
+ *     // msgId now contains the packet ID that was used
  * }
- * else
+ * else // error occurred
  * {
- *     // handle build error
+ *     // handle unsubscribe error
  * }
  * ~~~~~~~~
  */
 umqtt_Error_t
-umqtt_BuildUnsubscribe(umqtt_Handle_t h, umqtt_Data_t *pOutBuf, umqtt_Unsubscribe_Options_t *pOptions)
+umqtt_Unsubscribe(umqtt_Handle_t h,
+                       uint32_t count, const char *topics[], uint16_t *pId)
 {
     uint32_t idx = 0;
+    umqtt_Instance_t *this = h;
 
     // initial parameter check
-    RETURN_IF_ERR((pOutBuf == NULL) || (pOptions == NULL), UMQTT_ERR_PARM);
-    RETURN_IF_ERR(pOptions->pTopics == NULL, UMQTT_ERR_PARM);
-    RETURN_IF_ERR(pOptions->count == 0, UMQTT_ERR_PARM);
+    RETURN_IF_ERR(topics == NULL, UMQTT_ERR_PARM);
+    RETURN_IF_ERR(count == 0, UMQTT_ERR_PARM);
+
+    RETURN_IF_ERR(!this->isConnected, UMQTT_ERR_DISCONNECTED);
 
     // calculate the "remaining length" for the packet based on
     // the various input fields.
     uint16_t remainingLength = 2; // packet id
-    for (uint32_t i = 0; i < pOptions->count; i++)
+    for (uint32_t i = 0; i < count; i++)
     {
-        RETURN_IF_ERR(pOptions->pTopics[i].len == 0, UMQTT_ERR_PARM);
-        RETURN_IF_ERR(pOptions->pTopics[i].data == NULL, UMQTT_ERR_PARM);
+        RETURN_IF_ERR(topics[i] == NULL, UMQTT_ERR_PARM);
         remainingLength += 2; // topic length field
-        remainingLength += pOptions->pTopics[i].len;
+        remainingLength += strlen(topics[i]);
     }
 
-    // if handle is NULL but other parameters are okay then caller
-    // is asking for computed length of packet and no other action
-    if (h == NULL)
-    {
-        // use a dummy buf to encode the remaining length in order
-        // to find out how many bytes for the length field
-        uint8_t encBuf[4];
-        uint32_t byteCount = umqtt_EncodeLength(remainingLength, encBuf);
-
-        // return total packet length
-        pOutBuf->len = remainingLength + byteCount + 1;
-        return UMQTT_ERR_RET_LEN;
-    }
-
-    // get instance data from handle
-    umqtt_Instance_t *pInst = h;
-
-    // make sure valid data buffer
-    RETURN_IF_ERR((pOutBuf->data == NULL) || (pOutBuf->len < 7), UMQTT_ERR_PARM);
+    // allocate buffer needed to encode packet
+    uint8_t *buf = newPacket(this, remainingLength);
+    RETURN_IF_ERR(buf == NULL, UMQTT_ERR_BUFSIZE);
 
     // encode the remaining length into the appropriate position in the buffer
-    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &pOutBuf->data[1]);
+    uint32_t lenSize = umqtt_EncodeLength(remainingLength, &buf[1]);
 
-    // check that the caller provide buffer is going to be big enough
-    // for the rest of the packet
-    RETURN_IF_ERR((1 + lenSize + remainingLength) > pOutBuf->len, UMQTT_ERR_BUFSIZE);
-
-    // assign length of returned buffer
-    pOutBuf->len = 1 + lenSize + remainingLength;
+    // compute final length of packet with all data and headers
+    remainingLength += 1 + lenSize;
 
     // encode the packet type and adjust index ahead to
     // point at variable header
-    uint8_t *buf = pOutBuf->data;
     buf[0] = (UMQTT_TYPE_UNSUBSCRIBE << 4) | 0x02;
     idx = 1 + lenSize;
 
     // packet id
-    ++pInst->packetId;
-    if (pInst->packetId == 0)
+    ++this->packetId;
+    if (this->packetId == 0)
     {
-        pInst->packetId = 1;
+        this->packetId = 1;
     }
-    buf[idx++] = pInst->packetId >> 8;
-    buf[idx++] = pInst->packetId & 0xFF;
+    buf[idx++] = this->packetId >> 8;
+    buf[idx++] = this->packetId & 0xFF;
+    if (pId)
+    {
+        *pId = this->packetId;
+    }
 
     // encode each topic in topic array provided by caller
-    for (uint32_t i = 0; i < pOptions->count; i++)
+    for (uint32_t i = 0; i < count; i++)
     {
-        idx += umqtt_EncodeData(&pOptions->pTopics[i], &buf[idx]);
+        idx += umqtt_EncodeData((const uint8_t *)topics[i], strlen(topics[i]), &buf[idx]);
+    }
+
+    int len = this->pNet->pfnNetWritePacket(this->pNet->hNet, buf, remainingLength, false);
+    if (len == remainingLength)
+    {
+        // need to save the packet to wait for ack
+        enqueuePacket(this, buf, this->packetId, this->ticks);
+    }
+    else
+    {
+        deletePacket(this, buf);
+        return UMQTT_ERR_NETWORK; // network error
+    }
+
+    return UMQTT_ERR_OK;
+}
+
+/**
+ * Send a Ping (keep-alive) to the MQTT broker
+ *
+ * @param h umqtt instance handle from umqtt_New()
+ *
+ * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
+ *
+ * This function is used to send a Ping Request to the MQTT broker.  The
+ * client is required to periodically send Ping messages to keep the
+ * connection alive.  This function is provided as a convenience but should
+ * not normally ever need to be called by the client application.  The
+ * keep-alive/ping process is handled by the umqtt_Run() function.
+ */
+umqtt_Error_t
+umqtt_PingReq(umqtt_Handle_t h)
+{
+    umqtt_Instance_t *this = h;
+    static const uint8_t pingreqPacket[2] = { UMQTT_TYPE_PINGREQ << 4, 0 };
+
+    // initial parameter check
+    RETURN_IF_ERR(h == NULL, UMQTT_ERR_PARM);
+
+    // attempt to send pingreq packet
+    int len = this->pNet->pfnNetWritePacket(this->pNet->hNet, pingreqPacket,
+                                            2, false);
+    if (len != 2)
+    {
+        return UMQTT_ERR_NETWORK; // network error
     }
 
     return UMQTT_ERR_OK;
@@ -810,82 +1130,54 @@ umqtt_BuildUnsubscribe(umqtt_Handle_t h, umqtt_Data_t *pOutBuf, umqtt_Unsubscrib
 /**
  * Decode incoming MQTT packet.
  *
- * @param h the umqtt instance handle
- * @param pIncoming data structure holding the MQTT packet to decode
+ * @param h umqtt instance handle from umqtt_New()
+ * @param pIncoming buffer holding incoming UMQTT packet
+ * @param incomingLen number of bytes in the incoming buffer
  *
  * @return UMQTT_ERR_OK if successful, or an error code if an error occurred
  *
  * This function is used to decode incoming MQTT packets from the server.
- * The caller passes the buffer containing the packet through the data
- * structure _pIncoming_.  The packet will be decoded and the appropriate
- * decoded values will be passed back to the caller via the event callback
- * function (provided to umqtt_InitInstance()).  By processing the event data
- * in the callback function, the application can act on MQTT events, for
- * example receiving a new message for a subscribed topic.
+ * It is normally called from umqtt_Run() and the client application does
+ * not need to call this directly. However, it is provided for completeness.
  *
- * See the documentation for umqtt_EventCallback() for more details about
- * the callback function.
+ * The caller passes a buffer containing an MQTT protocol packet that was
+ * received from the network.  The packet will be decoded and if valid the
+ * appropriate action taken.  The action depends on the packet:
  *
- * This function performs some sanity checks on the packet to make sure it
- * is self-consistent as much as can be determined.  It also makes sure that
- * the length of the packet that is passed in is consistent with the
- * decoded MQTT length field in the packet.  If any problems are detected
- * with the packet, it returns UMQTT_ERR_PACKET_ERROR.
- *
- * __Example__
- * ~~~~~~~~.c
- * umqtt_Handle_t h; // previously acquired instance handle
- *
- * // umqtt event handler - will be called by umqtt_DecodePacket()
- * // when event occur (such as published topic)
- * void myEventCallback(umqtt_Handle_t h, umqtt_Event_t event)
- * {
- *     // process events that result from decoding packets
- *     switch (event)
- *     {
- *         // ...
- *     }
- * }
- *
- * // data structure to hold packet info
- * umqtt_Data_t incomingPkt;
- *
- * // assuming a network function to receive packets
- * mynet_receive_function(&incomingPkt.data, &incomingPkt.len);
- *
- * umqtt_Error_t err = umqtt_DecodePacket(h, &incomingPkt);
- * if (err != UMQTT_ERR_OK)
- * {
- *     // handle error
- * }
- * ~~~~~~~~
+ * Type     | Action
+ * ---------|-------
+ * CONNACK  | Free pending connect, notify client if callback is provided
+ * PUBLISH  | Extract publish topic, notify client through callback
+ * PUBACK   | Free pending Publish, notify client if callback is provided
+ * SUBACK   | Free pending Subscribe, notify client if callback is provided
+ * UNSUBACK | Free pending Unsubscribe, notify client if callback is provided
+ * PINGRESP | No action except notify client if a callback is provided
  */
 umqtt_Error_t
-umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
+umqtt_DecodePacket(umqtt_Handle_t h, const uint8_t *pIncoming, uint32_t incomingLen)
 {
     umqtt_Error_t err = UMQTT_ERR_OK;
 
     // basic parameter check
-    if ((h == NULL) || (pIncoming == NULL))
+    if ((h == NULL) || (pIncoming == NULL) || (incomingLen == 0))
     {
         return UMQTT_ERR_PARM;
     }
 
     // get instance data from handle
-    umqtt_Instance_t *pInst = h;
+    umqtt_Instance_t *this = h;
 
     // start processing the packet if it contains data
-    if (pIncoming->len)
+    if (incomingLen)
     {
         // extract the packet type, flags and length
-        uint8_t *pData = pIncoming->data;
-        uint8_t type = pData[0] >> 4;
-        uint8_t flags = pData[0] & 0x0F;
+        uint8_t type = pIncoming[0] >> 4;
+        uint8_t flags = pIncoming[0] & 0x0F;
         uint32_t remainingLen;
-        uint32_t lenCount = umqtt_DecodeLength(&remainingLen, &pData[1]);
+        uint32_t lenCount = umqtt_DecodeLength(&remainingLen, &pIncoming[1]);
         // make sure MQTT packet length is consistent with
         // the supplied network packet
-        if ((remainingLen + 1 + lenCount) != pIncoming->len)
+        if ((remainingLen + 1 + lenCount) != incomingLen)
         {
             return UMQTT_ERR_PACKET_ERROR;
         }
@@ -897,12 +1189,33 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             // CONNACK - pass ack info to callback
             case UMQTT_TYPE_CONNACK:
             {
-                if (pInst->EventCb)
+                // sanity check
+                RETURN_IF_ERR(remainingLen != 2, UMQTT_ERR_PACKET_ERROR);
+                // extract parameters from connack packet
+                bool sessionPresent = pIncoming[2] & 1 ? true : false;
+                uint8_t returnCode = pIncoming[3];
+
+                // remove any pending connects from the wait queue
+                uint8_t *buf;
+                do
                 {
-                    umqtt_Connect_Result_t result;
-                    result.sessionPresent = pData[2] & 1 ? true : false;
-                    result.returnCode = pData[3];
-                    pInst->EventCb(h, UMQTT_EVENT_CONNECTED, &result, pInst->pUser);
+                    buf = dequeuePacketByType(this, UMQTT_TYPE_CONNECT);
+                    if (buf)
+                    {
+                        deletePacket(this, buf);
+                    }
+                } while (buf);
+
+                // update the connection state
+                // if return code is 0 then client is connected
+                this->connectIsPending = false;
+                this->isConnected = (returnCode == 0);
+                this->pingTicks = this->ticks;
+
+                // notify client of connack
+                if (this->pCb->connackCb)
+                {
+                    this->pCb->connackCb(h, this->pUser, sessionPresent, returnCode);
                 }
                 break;
             }
@@ -910,39 +1223,41 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             // PUBLISH - extract published topic, payload and options
             case UMQTT_TYPE_PUBLISH:
             {
-                umqtt_Publish_Options_t pubdata;
+                const char *pTopic;
+                const uint8_t *pMsg = NULL;
                 uint8_t pktId[2] = {0, 0};
 
                 // make sure there is a callback function
-                if (pInst->EventCb)
+                // @todo do we need to process packet even if no callback?
+                // what if qos != 0 we still need to reply to sender
+                if (this->pCb->publishCb)
                 {
                     // extract publish options
-                    pubdata.dup = flags & UMQTT_FLAG_DUP ? true : false;
-                    pubdata.retain = flags & UMQTT_FLAG_RETAIN ? true : false;
-                    pubdata.qos = (flags & UMQTT_FLAG_QOS) >> UMQTT_FLAG_QOS_SHIFT;
-                    RETURN_IF_ERR(pubdata.qos > 2, UMQTT_ERR_PACKET_ERROR);
+                    bool dup = flags & UMQTT_FLAG_DUP ? true : false;
+                    bool retain = flags & UMQTT_FLAG_RETAIN ? true : false;
+                    uint8_t qos = (flags & UMQTT_FLAG_QOS) >> UMQTT_FLAG_QOS_SHIFT;
+                    RETURN_IF_ERR(qos > 2, UMQTT_ERR_PACKET_ERROR);
 
                     // find the topic length and value
                     // make sure remaining packet length is long enough
                     uint32_t idx = 1 + lenCount;
-                    uint16_t topicLen = (pData[idx] << 8) + pData[idx + 1];
+                    uint16_t topicLen = (pIncoming[idx] << 8) + pIncoming[idx + 1];
                     idx += 2;
                     RETURN_IF_ERR((topicLen + 2) > remainingLen, UMQTT_ERR_PACKET_ERROR);
 
-                    // extract the topic length and buf pointer into the
-                    // options struct for the callback
-                    pubdata.topic.len = topicLen;
-                    pubdata.topic.data = &pData[idx];
+                    // extract the topic length and buf pointer
+                    pTopic = (const char *)&pIncoming[idx];
                     remainingLen -= topicLen + 2;
                     idx += topicLen;
 
                     // for non-0 QoS, extract the packet id
-                    if (pubdata.qos != 0)
+                    // @todo check for qos 2 and signal error?
+                    if (qos != 0)
                     {
                         if (remainingLen >= 2)
                         {
-                            pktId[0] = pData[idx++];
-                            pktId[1] = pData[idx++];
+                            pktId[0] = pIncoming[idx++];
+                            pktId[1] = pIncoming[idx++];
                             remainingLen -= 2;
                         }
                         else
@@ -952,13 +1267,13 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                     }
 
                     // continue extracting if there is a topic payload
+                    uint16_t msgLen = 0;
                     if (remainingLen != 0)
                     {
-                        uint16_t msgLen = (pData[idx] << 8) + pData[idx + 1];
+                        msgLen = (pIncoming[idx] << 8) + pIncoming[idx + 1];
                         idx += 2;
                         RETURN_IF_ERR((msgLen + 2) > remainingLen, UMQTT_ERR_PACKET_ERROR);
-                        pubdata.message.len = msgLen;
-                        pubdata.message.data = &pData[idx];
+                        pMsg = &pIncoming[idx];
                         remainingLen -= msgLen + 2;
                     }
                     // check remaining length now.  it should be 0 since all
@@ -966,22 +1281,20 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
                     RETURN_IF_ERR(remainingLen != 0, UMQTT_ERR_PACKET_ERROR);
 
                     // callback to provide the publish info to the app
-                    pInst->EventCb(h, UMQTT_EVENT_PUBLISH, &pubdata, pInst->pUser);
+                    this->pCb->publishCb(h, this->pUser, dup, retain, qos, pTopic, topicLen, pMsg, msgLen);
 
                     // if QoS is non-0, prepare a reply packet and
                     // notify through the callback
-                    // (note this only works for QoS 1 right now
-                    if (pubdata.qos != 0)
+                    // (note this only works for QoS 1 right now)
+                    if (qos != 0)
                     {
-                        umqtt_Data_t puback;
                         uint8_t pubackdat[4];
-                        pubackdat[0] = 0x40;
+                        pubackdat[0] = UMQTT_TYPE_PUBACK << 4;
                         pubackdat[1] = 2;
                         pubackdat[2] = pktId[0];
                         pubackdat[3] = pktId[1];
-                        puback.len = 4;
-                        puback.data = pubackdat;
-                        pInst->EventCb(h, UMQTT_EVENT_REPLY, &puback, pInst->pUser);
+                        msgLen = this->pNet->pfnNetWritePacket(this->pNet->hNet, pubackdat, 4, false);
+                        RETURN_IF_ERR(msgLen != 4, UMQTT_ERR_NETWORK);
                     }
                 }
 
@@ -991,10 +1304,24 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             // PUBACK - server is acking the client publish, notify client
             case UMQTT_TYPE_PUBACK:
             {
-                if (pInst->EventCb)
+                // sanity check
+                RETURN_IF_ERR(remainingLen != 2, UMQTT_ERR_PACKET_ERROR);
+                uint16_t pktId = (pIncoming[2] << 8) + pIncoming[3];
+
+                // remove pending publish packet with this packet ID
+                uint8_t *buf;
+                do
                 {
-                    // TODO: something to verify packet id
-                    pInst->EventCb(h, UMQTT_EVENT_PUBACK, NULL, pInst->pUser);
+                    buf = dequeuePacketById(this, pktId);
+                    if (buf)
+                    {
+                        deletePacket(this, buf);
+                    }
+                } while (buf); // should not ever repeat
+
+                if (this->pCb->pubackCb)
+                {
+                    this->pCb->pubackCb(this, this->pUser, pktId);
                 }
                 break;
             }
@@ -1003,16 +1330,26 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             // notify client
             case UMQTT_TYPE_SUBACK:
             {
-                // make sure packet length makes sense
+                // sanity check
                 RETURN_IF_ERR(remainingLen < 3, UMQTT_ERR_PACKET_ERROR);
-                if (pInst->EventCb)
+                uint16_t pktId = (pIncoming[2] << 8) + pIncoming[3];
+
+                // remove pending subscribe packet with this packet ID
+                uint8_t *buf;
+                do
                 {
-                    umqtt_Data_t subackData;
-                    // TODO: something to verify packet id
-                    // pass suback payload back to client
-                    subackData.len = remainingLen - 2;
-                    subackData.data = &pData[4];
-                    pInst->EventCb(h, UMQTT_EVENT_SUBACK, &subackData, pInst->pUser);
+                    buf = dequeuePacketById(this, pktId);
+                    if (buf)
+                    {
+                        deletePacket(this, buf);
+                    }
+                } while (buf); // should not ever repeat
+
+                if (this->pCb->subackCb)
+                {
+                    uint16_t topicCount = remainingLen - 2;
+                    const uint8_t *topicList = &pIncoming[4];
+                    this->pCb->subackCb(this, this->pUser, topicList, topicCount, pktId);
                 }
                 break;
             }
@@ -1020,10 +1357,24 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             // UNSUBACK - notify client
             case UMQTT_TYPE_UNSUBACK:
             {
-                if (pInst->EventCb)
+                // sanity check
+                RETURN_IF_ERR(remainingLen != 2, UMQTT_ERR_PACKET_ERROR);
+                uint16_t pktId = (pIncoming[2] << 8) + pIncoming[3];
+
+                // remove pending unsub packet with this packet ID
+                uint8_t *buf;
+                do
                 {
-                    // TODO: something to verify packet id
-                    pInst->EventCb(h, UMQTT_EVENT_UNSUBACK, NULL, pInst->pUser);
+                    buf = dequeuePacketById(this, pktId);
+                    if (buf)
+                    {
+                        deletePacket(this, buf);
+                    }
+                } while (buf); // should not ever repeat
+
+                if (this->pCb->unsubackCb)
+                {
+                    this->pCb->unsubackCb(this, this->pUser, pktId);
                 }
                 break;
             }
@@ -1031,9 +1382,11 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
             // PINGRESP - notify client
             case UMQTT_TYPE_PINGRESP:
             {
-                if (pInst->EventCb)
+                // sanity check
+                RETURN_IF_ERR(remainingLen != 0, UMQTT_ERR_PACKET_ERROR);
+                if (this->pCb->pingrespCb)
                 {
-                    pInst->EventCb(h, UMQTT_EVENT_PINGRESP, NULL, pInst->pUser);
+                    this->pCb->pingrespCb(this, this->pUser);
                 }
                 break;
             }
@@ -1056,26 +1409,71 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
 }
 
 /**
- * Initialize the umqtt instance structure.
+ * Get the status of the connection.
  *
- * @param pInst instance data structure that is provided by the caller
- * @param pfnEvent callback function used to notify client about
- * MQTT events
+ * @param h umqtt instance handle from umqtt_New()
+ *
+ * Use this function to determine the state of connectedness of the
+ * UMQTT client.  It will return one of the following:
+ *
+ * * UMQTT_ERR_CONNECTED
+ * * UMQTT_ERR_CONNECT_PENDING
+ * * UMQTT_ERR_DISCONNECTED
+ *
+ * @return return code indicating the connection state
+ */
+umqtt_Error_t
+umqtt_GetConnectedStatus(umqtt_Handle_t h)
+{
+    if (h == NULL)
+    {
+        return UMQTT_ERR_PARM;
+    }
+    umqtt_Instance_t *this = h;
+
+    if (this->isConnected)              { return UMQTT_ERR_CONNECTED; }
+    else if (this->connectIsPending)    { return UMQTT_ERR_CONNECT_PENDING; }
+    else                                { return UMQTT_ERR_DISCONNECTED; }
+}
+
+/**
+ * Create and initialize a umqtt client instance.
+ *
+ * @param pTransport structure defining the MQTT transport interface
+ * @param pCallbacks structure holding the callback functions
+ * @param pUser optional caller defined data pointer that will be passed in callbacks
  *
  * @return _umqtt_ instance handle that should be used for all other
  * function calls, or NULL if there is an error.
  *
- * The client uses this function to initialize the instance structure before
- * using any other _umqtt_ functions.  The client allocates the space needed
- * for the structure.
+ * This function will allocate a _umqtt_ instance and initialize it.  No
+ * actual MQTT operations are performed.  The caller must provide the
+ * network access functions through the pTransport parameter.  Callback
+ * functions are used for notification and are optional.  If used, callback
+ * functions are provided by the pCallbacks parameter.  The entire parameter
+ * can be NULL if no callbacks are used, or individual callbacks can be
+ * NULL within the structure.
  *
  * __Example__
  * ~~~~~~~~.c
- * umqtt_Instance_t theInstance;
- * umqtt_Handle_t h;
- * void myEventCallback(umqtt_Handle_t h, umqtt_Event_t event);
+ * void PublishCb(umqtt_Handle_t h, void *pUser, bool dup, bool retain,
+ *                const char *topic, uint16_t topicLen,
+ *                const uint8_t *msg, uint16_t msgLen)
+ * {
+ *     // publish handler
+ * }
  *
- * h = umqtt_InitInstance(&theInstance, myEventCallback);
+ * umqtt_TransportConfig_t transport =
+ * {
+ *     myNetworkHandle, // optional, if network has a handle or instance
+ *     malloc, free,
+ *     myNetReadFunction, myNetWriteFunction
+ * };
+ * umqtt_Callbacks_t callbacks = // only publish callback is defined
+ *     { NULL, PublishCb, NULL, NULL, NULL, NULL };
+ *
+ * umqtt_Handle_t h;
+ * h = umqtt_New(&transport, &callbacks, NULL);
  * if (h == NULL)
  * {
  *     // handle error
@@ -1083,19 +1481,225 @@ umqtt_DecodePacket(umqtt_Handle_t h, umqtt_Data_t *pIncoming)
  * ~~~~~~~~
  */
 umqtt_Handle_t
-umqtt_InitInstance(void *pInst,
-                   void (*pfnEvent)(umqtt_Handle_t, umqtt_Event_t, void *, void *),
-                   void *pUser)
+umqtt_New(umqtt_TransportConfig_t *pTransport, umqtt_Callbacks_t *pCallbacks, void *pUser)
 {
-    if (pInst == NULL)
+    if (!pTransport)
     {
         return NULL;
     }
-    umqtt_Instance_t *this = pInst;
-    this->EventCb = pfnEvent;
+    if (!pTransport->pfnmalloc || !pTransport->pfnfree
+     || !pTransport->pfnNetReadPacket || !pTransport->pfnNetWritePacket
+     || !pTransport->hNet)
+    {
+        return NULL;
+    }
+    umqtt_Instance_t *this = pTransport->pfnmalloc(sizeof(umqtt_Instance_t));
+    if (!this)
+    {
+        return NULL;
+    }
+    this->pNet = pTransport;
+    this->pCb = pCallbacks;
     this->pUser = pUser;
     this->packetId = 0;
-    return pInst;
+    this->pktList.next = NULL;
+    this->pktList.packetId = 0;
+    this->pktList.ticks = 0;
+    this->ticks = 0;
+    this->pingTicks = 0;
+    this->isConnected = false;
+    this->connectIsPending = false;
+    this->keepAlive = 0;
+    return this;
+}
+
+/**
+ * Clean up and free umqtt client instance.
+ *
+ * @param h umqtt instance handle from umqtt_New()
+ *
+ * This function is used to free all allocated memory by the umqtt
+ * instance.  It should be called as part of an orderly shutdown.
+ */
+void
+umqtt_Delete(umqtt_Handle_t h)
+{
+    if (h)
+    {
+        umqtt_Instance_t *this = h;
+        freeAllQueuedPackets(this);
+        void (*pfnfree)(void *ptr) = this->pNet->pfnfree;
+        memset(h, 0, sizeof(umqtt_Instance_t));
+        pfnfree(h);
+    }
+}
+
+/**
+ * Main loop processing for the umqtt client instance
+ *
+ * @param h umqtt instance handle from umqtt_New()
+ * @param msTicks milliseconds tick count
+ *
+ * @return UMQTT_ERR_OK if everything is normal, or an error code if
+ * something goes wrong
+ *
+ * This function should be called repeatedly from the application main loop.
+ * The application must maintain an incrementing millisecond tick counter
+ * and pass that to the Run function.  This tick value is used to keep track
+ * of internal timeouts.  The Run function performs the following actions:
+ *
+ * - check for any incoming packets, decode and process
+ * - check for ping timeout and send ping packet if needed
+ * - check for timed out pending packets and resend or expire
+ *
+ * The Run function can encounter several kinds of errors while peforming
+ * its process.  If nothing goes wrong it will return UMQTT_ERR_OK.  If
+ * something goes wrong, it will return the most recent error code, even
+ * if multiple errors are encountered.  For this reason, the caller cannot
+ * conclusively know the cause of a problem based on error code.  Instead,
+ * the presence of a non-OK return value means that something has gone
+ * wrong and the caller should probably initiate a recovery procedure.  Even
+ * when errors are encountered, the Run function attempts to carry out all
+ * required actions and does not automatically disconnect or change internal
+ * state.  The following error codes can be returned:
+ *
+ * Code                      | Reason
+ * --------------------------|-------
+ * UMQTT_ERR_OK              | Run() did not encounter any problem
+ * UMQTT_ERR_PARM            | detected an error in a function parameter
+ * UMQTT_ERR_BUFSIZE         | memory allocation failed
+ * UMQTT_ERR_NETWORK         | error reading or writing the network
+ * UMQTT_ERR_TIMEOUT         | a pending packet has timed out
+ *
+ * In the case of UMQTT_ERR_TIMEOUT, it means either that no CONNACK was
+ * received in response to a Connect attempt, or that one of the other
+ * pending packet types has completely expired all of its retry attempts.
+ * In any case this probably indicates something has gone wrong with the
+ * connection to the MQTT broker.
+ */
+umqtt_Error_t
+umqtt_Run(umqtt_Handle_t h, uint32_t msTicks)
+{
+    umqtt_Error_t err = UMQTT_ERR_OK;
+    umqtt_Instance_t *this = h;
+    RETURN_IF_ERR(this == NULL, UMQTT_ERR_PARM);
+
+    this->ticks = msTicks;
+
+    // if connected or connect is pending, then need to process incoming
+    if (this->connectIsPending || this->isConnected)
+    {
+        // attempt to read from the network
+        // assumes always a whole packet is given
+        // cannot handle partial packets
+        uint8_t *pBuf;
+        int len;
+        len = this->pNet->pfnNetReadPacket(this->pNet->hNet, &pBuf);
+
+        // check for network error.  if so then remember error
+        // but keep going because there is more processing to do
+        if (len < 0)
+        {
+            err = UMQTT_ERR_NETWORK;
+        }
+
+        // non-zero means something was received, so decode the packet
+        // free it when we are finished
+        else if (len)
+        {
+            err = umqtt_DecodePacket(h, pBuf, len);
+            this->pNet->pfnfree(pBuf);
+        }
+
+        // if connected, then need to check for ping timeout
+        if (this->isConnected)
+        {
+            // use half of keepalive for ping timeout
+            // keepAlive * 1000 / 2 ==> keepAlive * 500
+            if ((this->ticks - this->pingTicks) > (this->keepAlive * 500))
+            {
+                this->pingTicks = this->ticks;
+                err = umqtt_PingReq(h);
+            }
+        }
+    }
+
+    // iterate through list of queued messages
+    PktBuf_t *pPrev = &this->pktList;
+    PktBuf_t *pPkt = this->pktList.next;
+    while (pPkt)
+    {
+        bool unlinkAndFree;
+        unlinkAndFree = false;
+        // check if the packet is past the retry timeout
+        if ((msTicks - pPkt->ticks) >= UMQTT_RETRY_TIMEOUT)
+        {
+            // get the payload part of the packet buffer
+            uint8_t *buf = (uint8_t *)pPkt;
+            buf += sizeof(PktBuf_t);
+            uint8_t type = buf[0] >> 4;
+
+            // check for connect packet
+            // if a connect packet times out, we dont retry
+            if (type == UMQTT_TYPE_CONNECT)
+            {
+                // mark packet to be unlinked and freed
+                unlinkAndFree = true;
+                err = UMQTT_ERR_TIMEOUT;
+                this->connectIsPending = false;
+            }
+
+            // all other packet type use the same processing
+            else
+            {
+                // if the packet has more life, then retry it
+                if (pPkt->ttl)
+                {
+                    // reduce retry count and reset the timeout ticks
+                    --pPkt->ttl;
+                    pPkt->ticks = this->ticks;
+                    // get the packet length, adjust for header
+                    uint32_t remLen;
+                    uint32_t lenBytes = umqtt_DecodeLength(&remLen, &buf[1]);
+                    remLen += 1 + lenBytes;
+                    // attempt to re-send the packet
+                    int writeLen = this->pNet->pfnNetWritePacket(this->pNet->hNet,
+                                                                 buf, remLen, false);
+                    // if there is an error then return error,
+                    // but packet is not deleted so it will be tried again
+                    if (writeLen != remLen)
+                    {
+                        err = UMQTT_ERR_NETWORK;
+                    }
+                }
+
+                // life expired for this packet dont retry again
+                else
+                {
+                    // unlink it from the list and free packet memory
+                    unlinkAndFree = true;
+                    err = UMQTT_ERR_TIMEOUT;
+                }
+            }
+        }
+
+        // if marked for deletion, update pointers and free packet
+        if (unlinkAndFree)
+        {
+            pPrev->next = pPkt->next;
+            pPkt->next = NULL;
+            this->pNet->pfnfree(pPkt);
+            pPkt = pPrev->next;
+        }
+
+        // packet not to be deleted, advance to the next in the list
+        else
+        {
+            pPrev = pPkt;
+            pPkt = pPkt->next;
+        }
+    }
+    return err;
 }
 
 /**
