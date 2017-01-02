@@ -779,7 +779,7 @@ umqtt_Publish(umqtt_Handle_t h,
     // calculate the "remaining length" for the packet based on
     // the various input fields.
     uint16_t remainingLength = (qos ? 2 : 0) + 2 + topicLen;
-    remainingLength += payload ? 2 + payloadLen: 0;
+    remainingLength += payload ? payloadLen: 0;
 
     // allocate buffer needed to encode packet
     uint8_t *buf = newPacket(this, remainingLength);
@@ -832,7 +832,8 @@ umqtt_Publish(umqtt_Handle_t h,
     // payload message
     if (payloadLen)
     {
-        idx += umqtt_EncodeData(payload, payloadLen, &buf[idx]);
+        memcpy(&buf[idx], payload, payloadLen);
+        idx += payloadLen;
     }
 
     int len = this->pNet->pfnNetWritePacket(this->pNet->hNet, buf, remainingLength, false);
@@ -1267,21 +1268,14 @@ umqtt_DecodePacket(umqtt_Handle_t h, const uint8_t *pIncoming, uint32_t incoming
                     }
 
                     // continue extracting if there is a topic payload
-                    uint16_t msgLen = 0;
                     if (remainingLen != 0)
                     {
-                        msgLen = (pIncoming[idx] << 8) + pIncoming[idx + 1];
-                        idx += 2;
-                        RETURN_IF_ERR((msgLen + 2) > remainingLen, UMQTT_ERR_PACKET_ERROR);
+                        // remainder of packet is the payload message
                         pMsg = &pIncoming[idx];
-                        remainingLen -= msgLen + 2;
                     }
-                    // check remaining length now.  it should be 0 since all
-                    // info has been extracted from the packet
-                    RETURN_IF_ERR(remainingLen != 0, UMQTT_ERR_PACKET_ERROR);
 
                     // callback to provide the publish info to the app
-                    this->pCb->publishCb(h, this->pUser, dup, retain, qos, pTopic, topicLen, pMsg, msgLen);
+                    this->pCb->publishCb(h, this->pUser, dup, retain, qos, pTopic, topicLen, pMsg, remainingLen);
 
                     // if QoS is non-0, prepare a reply packet and
                     // notify through the callback
@@ -1293,7 +1287,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, const uint8_t *pIncoming, uint32_t incoming
                         pubackdat[1] = 2;
                         pubackdat[2] = pktId[0];
                         pubackdat[3] = pktId[1];
-                        msgLen = this->pNet->pfnNetWritePacket(this->pNet->hNet, pubackdat, 4, false);
+                        int msgLen = this->pNet->pfnNetWritePacket(this->pNet->hNet, pubackdat, 4, false);
                         RETURN_IF_ERR(msgLen != 4, UMQTT_ERR_NETWORK);
                     }
                 }
