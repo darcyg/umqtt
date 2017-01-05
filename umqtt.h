@@ -147,7 +147,7 @@ typedef void (*UnsubackCb_t)(umqtt_Handle_t h, void *pUser, uint16_t pktId);
  * The umqtt_Run() function takes care of sending and receiving ping
  * messages at the appropriate time.
  */
-typedef void (*PingrespCb_t)(umqtt_Handle_t h, void *pUser);;
+typedef void (*PingrespCb_t)(umqtt_Handle_t h, void *pUser);
 
 /**
  * Structure to hold callback functions.
@@ -274,7 +274,7 @@ extern umqtt_Error_t umqtt_Publish(umqtt_Handle_t h, const char *topic,
                                    uint32_t qos, bool shouldRetain,
                                    uint16_t *pId);
 extern umqtt_Error_t umqtt_Subscribe(umqtt_Handle_t h, uint32_t count,
-                                     const char *topics[], uint8_t qoss[],
+                                     char *topics[], uint8_t qoss[],
                                      uint16_t *pId);
 extern umqtt_Error_t umqtt_Unsubscribe(umqtt_Handle_t h, uint32_t count,
                                        const char *topics[], uint16_t *pId);
@@ -287,6 +287,7 @@ extern umqtt_Error_t umqtt_Run(umqtt_Handle_t h, uint32_t msTicks);
 extern umqtt_Handle_t umqtt_New(umqtt_TransportConfig_t *pTransport,
                                          umqtt_Callbacks_t *pCallbacks, void *pUser);
 extern void umqtt_Delete(umqtt_Handle_t h);
+extern const char *umqtt_GetErrorString(umqtt_Error_t err);
 
 #ifdef __cplusplus
 extern }

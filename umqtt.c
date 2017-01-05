@@ -906,7 +906,7 @@ umqtt_Publish(umqtt_Handle_t h,
  */
 umqtt_Error_t
 umqtt_Subscribe(umqtt_Handle_t h,
-                uint32_t count, const char *topics[], uint8_t qoss[],
+                uint32_t count, char *topics[], uint8_t qoss[],
                 uint16_t *pId)
 {
     uint32_t idx = 0;
