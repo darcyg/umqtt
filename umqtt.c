@@ -1244,7 +1244,7 @@ umqtt_DecodePacket(umqtt_Handle_t h, const uint8_t *pIncoming, uint32_t incoming
                     uint32_t idx = 1 + lenCount;
                     uint16_t topicLen = (pIncoming[idx] << 8) + pIncoming[idx + 1];
                     idx += 2;
-                    RETURN_IF_ERR((topicLen + 2) > remainingLen, UMQTT_ERR_PACKET_ERROR);
+                    RETURN_IF_ERR((topicLen + 2U) > remainingLen, UMQTT_ERR_PACKET_ERROR);
 
                     // extract the topic length and buf pointer
                     pTopic = (const char *)&pIncoming[idx];
@@ -1657,7 +1657,7 @@ umqtt_Run(umqtt_Handle_t h, uint32_t msTicks)
                     uint32_t lenBytes = umqtt_DecodeLength(&remLen, &buf[1]);
                     remLen += 1 + lenBytes;
                     // attempt to re-send the packet
-                    int writeLen = this->pNet->pfnNetWritePacket(this->pNet->hNet,
+                    uint32_t writeLen = this->pNet->pfnNetWritePacket(this->pNet->hNet,
                                                                  buf, remLen, false);
                     // if there is an error then return error,
                     // but packet is not deleted so it will be tried again
