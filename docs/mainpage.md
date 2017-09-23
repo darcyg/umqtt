@@ -43,7 +43,7 @@ to allocate and free memory.  The concept of the network is completely
 abstract.  From the point of view of `umqtt` library, it is just a data
 pipe. It could be wired or wireless ethernet, or it could be a serial
 link.  Anything that can be used to transmit and receive data packets.
-The memory allocator can also be implemented in many ways.  The `umatt`
+The memory allocator can also be implemented in many ways.  The `umqtt`
 library only needs to receive memory it requests for holding packets.
 It doesn't matter how the memory is allocated.  It could just be a
 mapping to the run-time _malloc()/free()_ library functions.  Or it could be

@@ -1,0 +1,8 @@
+To publish the docs using gh-pages, create html subdir under docs and
+clone the whole repo from github in html.  Then switch to gh-pages branch.
+You should now just have the html generated docs in html.  Now you can run
+doxygen and it will update the files in html.  The html subdir now contains
+updates to the gh-pages branch which you can git add, commit and push.
+
+TODO: make a script to do all this
+
