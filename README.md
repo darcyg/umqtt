@@ -4,6 +4,8 @@ uMQTT Client Package
 This is a MQTT client implementation, meant to be straightforward and
 portable, and targeted for use on a microcontroller.
 
+[![Build Status](https://travis-ci.org/kroesche/umqtt.svg?branch=master)](https://travis-ci.org/kroesche/umqtt)
+
 License
 -------
 
